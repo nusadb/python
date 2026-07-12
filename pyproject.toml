@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nusadb"
+version = "0.1.0"
+description = "Pure-Python PEP-249 (DB-API 2.0) driver for NusaDB (Nusa Wire Protocol)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "NusaDB Authors" }]
+keywords = ["nusadb", "database", "sql", "dbapi", "pep249"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = []
+
+[project.optional-dependencies]
+sqlalchemy = ["SQLAlchemy>=1.4"]
+
+[project.entry-points."sqlalchemy.dialects"]
+nusadb = "nusadb.sqlalchemy:NusaDialect"
+
+[project.urls]
+Repository = "https://github.com/nusadb/nusadb"
+
+[tool.setuptools.packages.find]
+include = ["nusadb*"]
