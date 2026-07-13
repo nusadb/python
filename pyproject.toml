@@ -26,7 +26,8 @@ sqlalchemy = ["SQLAlchemy>=1.4"]
 nusadb = "nusadb.sqlalchemy:NusaDialect"
 
 [project.urls]
-Repository = "https://github.com/nusadb/nusadb"
+Repository = "https://github.com/nusadb/python"
+Issues = "https://github.com/nusadb/python/issues"
 
 [tool.setuptools.packages.find]
 include = ["nusadb*"]
