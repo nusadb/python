@@ -1,0 +1,117 @@
+name: Release
+
+# Publishes the `nusadb` package to PyPI.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Requires the PYPI_API_TOKEN secret (a PyPI API token, value starts with `pypi-`).
+#
+# Consider switching to PyPI Trusted Publishing instead: it uses the OIDC token this job
+# already has (`id-token: write`) and removes the long-lived secret entirely. Configure the
+# publisher at https://pypi.org/manage/project/nusadb/settings/publishing/, then delete the
+# `password:` line from the publish step below.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The version lives in two places: pyproject.toml and nusadb/__init__.py. Both must
+      # agree with the tag, or the sdist and the runtime would disagree about what this is.
+      - name: Verify the version matches the tag
+        run: |
+          python - <<'PY'
+          import os, pathlib, re, sys
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          init = re.search(
+              r'^__version__\s*=\s*["\'](.+?)["\']',
+              pathlib.Path("nusadb/__init__.py").read_text(),
+              re.M,
+          ).group(1)
+
+          errors = []
+          if pyproject != tag:
+              errors.append(f"pyproject.toml version {pyproject} != tag {tag}")
+          if init != tag:
+              errors.append(f"nusadb/__init__.py __version__ {init} != tag {tag}")
+          for e in errors:
+              print(f"::error::{e}")
+          sys.exit(1 if errors else 0)
+          PY
+          echo "releasing nusadb ${GITHUB_REF_NAME#v}"
+
+      # Gate the release on what is verifiable without a live server. The suite in tests/
+      # boots a real `nusadb-server` binary that this repository does not contain.
+      - name: Verify the package imports from an install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install '.[sqlalchemy]'
+          cd "$(mktemp -d)"  # import the installed package, not the source tree
+          python -c "
+          import nusadb
+          from nusadb.sqlalchemy import NusaDialect
+          assert hasattr(nusadb, 'connect')
+          print('nusadb', nusadb.__version__, 'imports; dialect', NusaDialect.__name__)
+          "
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+
+      - name: Check the artifacts
+        run: python -m twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # for PyPI Trusted Publishing / attestations
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag
