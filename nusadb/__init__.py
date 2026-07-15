@@ -42,7 +42,7 @@ apilevel = "2.0"
 threadsafety = 1  # threads may share the module but not connections
 paramstyle = "numeric"  # positional ``:1`` markers; the driver translates them to native ``$1``
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "connect",
