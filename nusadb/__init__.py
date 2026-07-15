@@ -11,12 +11,13 @@ Example::
     cur = conn.cursor()
     cur.execute("CREATE TABLE t (id INT NOT NULL, name TEXT)")
     cur.execute("INSERT INTO t VALUES ($1, $2)", [1, "alice"])
-    cur.execute("SELECT id, name FROM t WHERE id = $1", [1])
+    cur.execute("SELECT id, name FROM t WHERE id = :1", [1])
     print(cur.fetchall())
     conn.close()
 
-Parameter markers are positional ``$1``, ``$2`` (the server's native form);
-``paramstyle`` is reported as ``"numeric"``.
+``paramstyle`` is reported as ``"numeric"``, so PEP-249 code uses positional
+``:1``, ``:2`` markers. The server's own marker is ``$1``; the driver translates
+``:1`` → ``$1`` for you, and a query written with the native ``$1`` still works.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from .pool import Pool
 # PEP-249 module globals.
 apilevel = "2.0"
 threadsafety = 1  # threads may share the module but not connections
-paramstyle = "numeric"  # positional markers, written ``$1`` (server-native)
+paramstyle = "numeric"  # positional ``:1`` markers; the driver translates them to native ``$1``
 
 __version__ = "0.1.0"
 

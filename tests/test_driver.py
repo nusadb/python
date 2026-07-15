@@ -93,6 +93,39 @@ class _Server:
         self._tmp.cleanup()
 
 
+class PlaceholderTranslationTests(unittest.TestCase):
+    """`numeric` paramstyle (`:1`) → native `$1`, skipping strings/casts/comments/dollar-quotes.
+
+    Pure-function test (no server) for Q-PYDRIVER-PARAMSTYLE-MISMATCH.
+    """
+
+    def test_translation(self) -> None:
+        from nusadb.connection import _to_native_placeholders as t
+
+        cases = [
+            ("SELECT * FROM x WHERE id = :1", "SELECT * FROM x WHERE id = $1"),
+            ("SELECT :1, :2, :10", "SELECT $1, $2, $10"),
+            # `::` type cast is not a placeholder.
+            ("SELECT a::text WHERE id = :1", "SELECT a::text WHERE id = $1"),
+            # `:` inside a string literal is left alone.
+            ("SELECT '12:30' , :1", "SELECT '12:30' , $1"),
+            ("SELECT 'it''s :1 ok', :2", "SELECT 'it''s :1 ok', $2"),
+            # Native `$1` is already correct and untouched.
+            ("SELECT $1 FROM x", "SELECT $1 FROM x"),
+            # Comments and quoted identifiers are skipped.
+            ("SELECT 1 -- :1 comment\nWHERE id=:2", "SELECT 1 -- :1 comment\nWHERE id=$2"),
+            ("SELECT /* :1 */ :2", "SELECT /* :1 */ $2"),
+            ('SELECT "col:1" , :1', 'SELECT "col:1" , $1'),
+            # Dollar-quoted body is not rewritten.
+            (
+                "CREATE FUNCTION f() AS $$ SELECT :1 $$ LANGUAGE sql",
+                "CREATE FUNCTION f() AS $$ SELECT :1 $$ LANGUAGE sql",
+            ),
+        ]
+        for sql, expected in cases:
+            self.assertEqual(t(sql), expected, msg=f"translating {sql!r}")
+
+
 class TrustServerTests(unittest.TestCase):
     server: _Server
 

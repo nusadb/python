@@ -31,6 +31,94 @@ _Result = Tuple[
 ]
 
 
+def _to_native_placeholders(sql: str) -> str:
+    """Translate DB-API ``numeric`` placeholders (``:1``) to the server-native ``$1`` form.
+
+    The module declares ``paramstyle = "numeric"``, so portable PEP-249 code writes ``:1``; the Nusa
+    wire protocol's own marker is ``$1``. This rewrites ``:`` followed by digits, but only where it
+    is a real placeholder — never inside a single-quoted string, a double-quoted identifier, a
+    dollar-quoted string, a line/block comment, or a ``::`` type cast. A query that already uses the
+    native ``$1`` form is left untouched (only ``:digits`` is rewritten), so existing code keeps
+    working. (Q-PYDRIVER-PARAMSTYLE-MISMATCH.)
+    """
+    out: List[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "'" or c == '"':  # quoted string / identifier ('' and "" escape the quote)
+            quote = c
+            out.append(c)
+            i += 1
+            while i < n:
+                out.append(sql[i])
+                if sql[i] == quote:
+                    if i + 1 < n and sql[i + 1] == quote:
+                        out.append(sql[i + 1])
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "-" and i + 1 < n and sql[i + 1] == "-":  # line comment
+            while i < n and sql[i] != "\n":
+                out.append(sql[i])
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and sql[i + 1] == "*":  # block comment (PostgreSQL nests)
+            depth = 1
+            out.append("/*")
+            i += 2
+            while i < n and depth > 0:
+                if sql[i] == "/" and i + 1 < n and sql[i + 1] == "*":
+                    depth += 1
+                    out.append("/*")
+                    i += 2
+                elif sql[i] == "*" and i + 1 < n and sql[i + 1] == "/":
+                    depth -= 1
+                    out.append("*/")
+                    i += 2
+                else:
+                    out.append(sql[i])
+                    i += 1
+            continue
+        if c == "$":  # dollar-quoted string $tag$...$tag$, or a native $1 marker (left as-is)
+            j = i + 1
+            while j < n and (sql[j].isalnum() or sql[j] == "_"):
+                j += 1
+            if j < n and sql[j] == "$":
+                tag = sql[i : j + 1]
+                out.append(tag)
+                i = j + 1
+                end = sql.find(tag, i)
+                if end == -1:
+                    out.append(sql[i:])
+                    i = n
+                else:
+                    out.append(sql[i : end + len(tag)])
+                    i = end + len(tag)
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if c == ":":
+            if i + 1 < n and sql[i + 1] == ":":  # :: type cast — never a placeholder
+                out.append("::")
+                i += 2
+                continue
+            j = i + 1
+            while j < n and sql[j].isdigit():
+                j += 1
+            if j > i + 1:  # :<digits> → $<digits>
+                out.append("$")
+                out.append(sql[i + 1 : j])
+                i = j
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _encode_param(value: Any) -> Optional[bytes]:
     """Encode one bound parameter as wire **text** bytes (``None`` = SQL NULL)."""
     if value is None:
@@ -551,6 +639,7 @@ class Connection:
 
     def _extended_query(self, sql: str, params: Sequence[Any]) -> _Result:
         self._begin_if_needed()
+        sql = _to_native_placeholders(sql)
         encoded = [_encode_param(p) for p in params]
         self._send(proto.parse("", sql))
         self._send(proto.bind("", "", encoded))
@@ -561,7 +650,7 @@ class Connection:
 
     def _prepare(self, sql: str) -> str:
         name = f"nusa_stmt_{next(self._names)}"
-        self._send(proto.parse(name, sql))
+        self._send(proto.parse(name, _to_native_placeholders(sql)))
         self._send(proto.sync())
         self._read_until_ready()  # ParseComplete + Ready; raises on a parse error
         return name
