@@ -25,16 +25,24 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _target_dirs() -> list[Path]:
-    """Candidate Cargo target directories, honouring ``CARGO_TARGET_DIR``."""
+    """Candidate Cargo target directories, honouring ``CARGO_TARGET_DIR``: the engine checkout
+    beside or above this one."""
     dirs: list[Path] = []
     env = os.environ.get("CARGO_TARGET_DIR")
     if env:
         dirs.append(Path(env))
-    dirs.append(REPO_ROOT / "target")
+    here = Path(__file__).resolve().parents[1]
+    dirs += [REPO_ROOT / "nusadb" / "target", REPO_ROOT / "target", here.parent / "nusadb" / "target"]
     return dirs
 
 
 def _server_binary() -> Path:
+    # An explicit binary first: NUSADB_SERVER_BIN=/path/to/nusadb-server python -m unittest ...
+    explicit = os.environ.get("NUSADB_SERVER_BIN")
+    if explicit:
+        if Path(explicit).exists():
+            return Path(explicit)
+        raise unittest.SkipTest(f"NUSADB_SERVER_BIN={explicit} does not exist")
     for base in _target_dirs():
         for profile in ("debug", "release"):
             for name in ("nusadb-server.exe", "nusadb-server"):
@@ -67,22 +75,35 @@ class _Server:
     """A child ``nusadb-server`` process on an ephemeral port."""
 
     def __init__(self, *extra_args: str) -> None:
-        self.port = _free_port()
-        self._tmp = tempfile.TemporaryDirectory()
-        self._proc = subprocess.Popen(
-            [
-                str(_server_binary()),
-                "--listen",
-                f"127.0.0.1:{self.port}",
-                "--data-dir",
-                self._tmp.name,
-                *extra_args,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env={**os.environ, "RUST_LOG": "error"},
-        )
-        _wait_ready(self.port)
+        # The port is free when picked but not reserved: a test running alongside can take it
+        # first, and this server then fails to bind and exits. Seeing that, start again.
+        binary = str(_server_binary())
+        for _ in range(5):
+            self.port = _free_port()
+            self._tmp = tempfile.TemporaryDirectory()
+            self._proc = subprocess.Popen(
+                [
+                    binary,
+                    "--listen",
+                    f"127.0.0.1:{self.port}",
+                    "--data-dir",
+                    self._tmp.name,
+                    *extra_args,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, "RUST_LOG": "error"},
+            )
+            try:
+                _wait_ready(self.port)
+            except RuntimeError:
+                self.stop()
+                raise
+            time.sleep(0.15)
+            if self._proc.poll() is None:
+                return
+            self._tmp.cleanup()
+        raise RuntimeError("nusadb-server did not start")
 
     def stop(self) -> None:
         self._proc.terminate()
@@ -90,13 +111,14 @@ class _Server:
             self._proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self._proc.kill()
+            self._proc.wait()
         self._tmp.cleanup()
 
 
 class PlaceholderTranslationTests(unittest.TestCase):
     """`numeric` paramstyle (`:1`) → native `$1`, skipping strings/casts/comments/dollar-quotes.
 
-    Pure-function test (no server) for Q-PYDRIVER-PARAMSTYLE-MISMATCH.
+    Pure-function test (no server).
     """
 
     def test_translation(self) -> None:
@@ -243,8 +265,8 @@ class TrustServerTests(unittest.TestCase):
         conn.close()
 
     def test_array_element_typing(self) -> None:
-        # Protocol 1.2: an array's elements decode at the column's element type — ints as ints,
-        # floats as floats, text stays str — with SQL NULL preserved as None (array-elem-text).
+        # Protocol 1.2: an array's elements decode at the column's element type (ints as ints,
+        # floats as floats, text stays str), with SQL NULL preserved as None.
         conn = self._connect()
         cur = conn.cursor()
         from decimal import Decimal
@@ -252,7 +274,8 @@ class TrustServerTests(unittest.TestCase):
         cur.execute("CREATE TABLE arrt (ints INT[], texts TEXT[], flts FLOAT[], nums NUMERIC[])")
         cur.execute(
             "INSERT INTO arrt VALUES "
-            "(ARRAY[1, 2, NULL], ARRAY['a', 'b'], ARRAY[1.5, 2.5], ARRAY[1.5, 2.25])"
+            "(ARRAY[1, 2, NULL], ARRAY['a', 'b'], "
+            "ARRAY[CAST(1.5 AS FLOAT), CAST(2.5 AS FLOAT)], ARRAY[1.5, 2.25])"
         )
         cur.execute("SELECT ints, texts, flts, nums FROM arrt")
         ints, texts, flts, nums = cur.fetchone()
@@ -264,6 +287,37 @@ class TrustServerTests(unittest.TestCase):
         # NUMERIC[] elements decode as Decimal, not float.
         self.assertEqual(nums, [Decimal("1.5"), Decimal("2.25")])
         self.assertTrue(all(isinstance(x, Decimal) for x in nums))
+        conn.close()
+
+    def test_array_and_json_param_binding(self) -> None:
+        # A Python list/tuple binds as a SQL array literal ({a,b}), and a dict binds as JSON text,
+        # not the Python repr a bare str() would produce. Special characters round-trip.
+        conn = self._connect()
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE pbind (i INT, t TEXT[], n INT[][], j JSONB)")
+        cur.execute(
+            "INSERT INTO pbind VALUES ($1, $2, $3, $4)",
+            [1, ["a,b", 'c"d', None, "{brace}", ""], [[1, 2], [3, 4]], {"k": [1, 2], "z": None}],
+        )
+        cur.execute("SELECT i, t, n, j FROM pbind")
+        i, t, n, j = cur.fetchone()
+        self.assertEqual(i, 1)
+        self.assertEqual(t, ["a,b", 'c"d', None, "{brace}", ""])
+        self.assertEqual(n, [[1, 2], [3, 4]])
+        self.assertEqual(j, {"k": [1, 2], "z": None})
+        conn.close()
+
+    def test_error_sqlstate_attribute(self) -> None:
+        # A server error exposes its five-character SQLSTATE as `.sqlstate` (so callers branch on the
+        # code, not the message text) while `str(e)` keeps the "CODE: message" form.
+        conn = self._connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT 1 / 0")
+            self.fail("expected a division-by-zero error")
+        except nusadb.Error as exc:
+            self.assertEqual(getattr(exc, "sqlstate", None), "22012")
+            self.assertTrue(str(exc).startswith("22012:"))
         conn.close()
 
     def test_interval_decoding(self) -> None:

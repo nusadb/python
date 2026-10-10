@@ -64,7 +64,7 @@ jobs:
       - name: Verify the package imports from an install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install '.[sqlalchemy]'
+          python -m pip install '.[asyncio]'
           cd "$(mktemp -d)"  # import the installed package, not the source tree
           python -c "
           import nusadb
@@ -114,4 +114,9 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --verify-tag
+        # The notes are this version's section of CHANGELOG.md.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 == "## " v {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for $version" >&2; exit 1; }
+          gh release create "${GITHUB_REF_NAME}" --notes-file notes.md --verify-tag

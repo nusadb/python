@@ -31,6 +31,9 @@ TYPE_TAGS = {
     0x0E: "JSON", 0x0F: "ARRAY", 0x10: "VECTOR",
 }
 
+# The tag byte for each type name, for declaring parameter types in ``Parse``.
+TAG_BYTES = {name: tag for tag, name in TYPE_TAGS.items()}
+
 # Protocol 1.2: an ARRAY column's tag is ``ARRAY_ELEMENT_FLAG | <element tag>`` (e.g. INT[] = 0x82),
 # so the element type travels with the column and the row decoder casts the elements at their type.
 ARRAY_ELEMENT_FLAG = 0x80
@@ -38,8 +41,8 @@ ARRAY_ELEMENT_FLAG = 0x80
 
 def type_name(tag: int) -> str:
     """Canonical type name for a RowDescriptionTyped type tag (UNKNOWN if unrecognised). An
-    element-typed array tag (protocol 1.2, ``0x80 | element``) is named ``ARRAY:<element>`` —
-    e.g. ``ARRAY:INT`` — so the row decoder can cast the elements at their real type."""
+    element-typed array tag (protocol 1.2, ``0x80 | element``) is named ``ARRAY:<element>``
+    (``ARRAY:INT``, say), so the row decoder can cast the elements at their real type."""
     if tag & ARRAY_ELEMENT_FLAG:
         return "ARRAY:" + TYPE_TAGS.get(tag & ~ARRAY_ELEMENT_FLAG, "UNKNOWN")
     return TYPE_TAGS.get(tag, "UNKNOWN")
@@ -206,8 +209,15 @@ def query(sql: str) -> bytes:
     return Writer().string(sql).frame(T_QUERY)
 
 
-def parse(name: str, sql: str) -> bytes:
-    return Writer().string(name).string(sql).u16(0).frame(T_PARSE)
+def parse(name: str, sql: str, param_tags: bytes = b"") -> bytes:
+    """A ``Parse`` frame declaring each parameter's type (one tag byte per ``$n``, §9.2); an empty
+    list lets the server infer every type."""
+    return Writer().string(name).string(sql).u16(len(param_tags)).raw(param_tags).frame(T_PARSE)
+
+
+def close_statement(name: str) -> bytes:
+    """A ``Close`` frame freeing the prepared statement ``name``."""
+    return Writer().u8(ord("S")).string(name).frame(T_CLOSE)
 
 
 def bind(portal: str, statement: str, params: List[Optional[bytes]]) -> bytes:

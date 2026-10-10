@@ -9,6 +9,7 @@ The standard tree::
           +-- DatabaseError
                +-- DataError
                +-- OperationalError
+               |    +-- TransactionRolledBack
                +-- IntegrityError
                +-- InternalError
                +-- ProgrammingError
@@ -25,6 +26,9 @@ class Warning(Exception):  # noqa: N818 - name mandated by PEP-249
 class Error(Exception):  # noqa: N818 - name mandated by PEP-249
     """Base class of all driver errors."""
 
+    #: The server's five-character SQLSTATE, or ``None`` for an error raised by the driver itself.
+    sqlstate: "str | None" = None
+
 
 class InterfaceError(Error):
     """An error related to the driver/interface rather than the database."""
@@ -40,6 +44,11 @@ class DataError(DatabaseError):
 
 class OperationalError(DatabaseError):
     """An operational problem (disconnect, transport failure, auth)."""
+
+
+class TransactionRolledBack(OperationalError):
+    """``COMMIT`` found the transaction failed (a statement in it raised an error), so the server
+    rolled it back: none of its work was saved."""
 
 
 class IntegrityError(DatabaseError):
@@ -59,11 +68,12 @@ class NotSupportedError(DatabaseError):
 
 
 def from_sqlstate(code: str, message: str) -> DatabaseError:
-    """Map a server SQLSTATE (``docs/wire-protocol.md`` §14) to the closest
-    PEP-249 exception. The current server emits ``XX000`` for most errors, so the
-    default is :class:`ProgrammingError` (the typical cause from a client).
+    """Map a server SQLSTATE (``docs/wire-protocol.md`` §14) to the closest PEP-249 exception.
+
+    The mapping reads the two-character class, not the whole code, so a code the server refines
+    within a class still maps the same way. An unknown class maps to :class:`ProgrammingError`.
+    The five-character code itself is kept on the exception as ``sqlstate``.
     """
-    cls_class = code[:2]
     mapping = {
         "23": IntegrityError,
         "22": DataError,
@@ -71,6 +81,15 @@ def from_sqlstate(code: str, message: str) -> DatabaseError:
         "08": OperationalError,
         "28": OperationalError,
         "0A": NotSupportedError,
+        "XX": InternalError,
+        # Transaction state, resources or an operator: retrying after a rollback or a backoff is
+        # the way through, which is what OperationalError tells a caller.
+        "25": OperationalError,
+        "40": OperationalError,
+        "53": OperationalError,
+        "57": OperationalError,
+        "58": OperationalError,
     }
-    exc = mapping.get(cls_class, ProgrammingError)
-    return exc(f"{code}: {message}")
+    err = mapping.get(code[:2], ProgrammingError)(f"{code}: {message}")
+    err.sqlstate = code
+    return err

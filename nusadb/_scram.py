@@ -14,7 +14,7 @@ import os
 from typing import Tuple
 
 _GS2_HEADER = "n,,"
-# base64("n,,") — the channel-binding value `c=` in client-final.
+# base64("n,,"): the channel-binding value `c=` in client-final.
 _CHANNEL_BINDING = base64.b64encode(_GS2_HEADER.encode("ascii")).decode("ascii")
 
 

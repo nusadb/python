@@ -46,10 +46,15 @@ jobs:
 
       - name: Resolve the SQLAlchemy dialect entry point
         run: |
-          python -m pip install 'SQLAlchemy>=1.4'
+          python -m pip install 'SQLAlchemy[asyncio]>=2.0'
           python -c "
-          from nusadb.sqlalchemy import NusaDialect
-          print('dialect ok:', NusaDialect.__name__)
+          import nusadb.aio
+          from nusadb.sqlalchemy import NusaDialect, NusaDialect_asyncio
+          from sqlalchemy import create_engine
+          from sqlalchemy.ext.asyncio import create_async_engine
+          create_engine('nusadb://u@127.0.0.1:1/db')
+          create_async_engine('nusadb+asyncio://u@127.0.0.1:1/db')
+          print('dialects ok:', NusaDialect.__name__, NusaDialect_asyncio.__name__)
           "
 
   package:

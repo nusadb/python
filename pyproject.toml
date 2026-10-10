@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nusadb"
-version = "0.1.1"
+version = "0.1.2"
 description = "Pure-Python PEP-249 (DB-API 2.0) driver for NusaDB (Nusa Wire Protocol)"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -20,10 +20,12 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-sqlalchemy = ["SQLAlchemy>=1.4"]
+sqlalchemy = ["SQLAlchemy>=2.0"]
+asyncio = ["SQLAlchemy[asyncio]>=2.0"]
 
 [project.entry-points."sqlalchemy.dialects"]
 nusadb = "nusadb.sqlalchemy:NusaDialect"
+"nusadb.asyncio" = "nusadb.sqlalchemy:NusaDialect_asyncio"
 
 [project.urls]
 Repository = "https://github.com/nusadb/python"

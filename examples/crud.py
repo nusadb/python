@@ -15,7 +15,7 @@ import nusadb
 
 
 def main() -> None:
-    conn = nusadb.connect(host="127.0.0.1", port=5678, user="nusa-root", database="nusadb")
+    conn = nusadb.connect(host="127.0.0.1", port=5678, user="nusadb-root", database="nusadb")
     cur = conn.cursor()
 
     cur.execute("CREATE TABLE IF NOT EXISTS people (id INT NOT NULL, name TEXT, age INT)")
