@@ -11,6 +11,7 @@ API and SQLAlchemy dialects for both.
 pip install nusadb                 # the driver (blocking and asyncio)
 pip install "nusadb[sqlalchemy]"   # with SQLAlchemy
 pip install "nusadb[asyncio]"      # with SQLAlchemy's asyncio support
+pip install "nusadb[django]"       # with Django
 ```
 
 ## Usage
@@ -412,6 +413,53 @@ per connection. A connection whose socket died is recognised as lost and replace
 `pool_pre_ping=True` to check before each checkout). `LIMIT`/`OFFSET` are inlined as constants, which
 the server requires.
 
+## Django
+
+`nusadb.django` is a database backend for Django 4.2 (`pip install "nusadb[django]"`):
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "nusadb.django",
+        "NAME": "app",
+        "USER": "app",
+        "PASSWORD": os.environ["DB_PASSWORD"],
+        "HOST": "db.example",
+        "PORT": "5678",
+        "OPTIONS": {"isolation_level": "serializable", "statement_timeout": 30},
+    }
+}
+```
+
+`OPTIONS` takes `isolation_level` (`"read committed"`, `"repeatable read"`, `"serializable"`, ...)
+and the driver's `ssl`, `timeout`, `connect_timeout`, `statement_timeout` and `keepalive`. An empty
+`NAME` opens the default database `nusadb`. Migrations run in a transaction and roll back as a
+whole. Tests get their own database through `CREATE DATABASE`, so `USER` must be allowed to create
+databases (the superuser `nusadb-root`, or a role with `CREATEDB`). `manage.py dbshell` runs
+`nusadb-cli`, with the password passed in `NUSADB_PASSWORD`.
+
+Known limits:
+
+- Constraints are checked at each statement; there are no deferrable constraints, so fixtures must
+  list rows before the rows that refer to them.
+- `select_for_update()` works on one table: not with `select_related()`, `of=` or `no_key=True`.
+  `nowait` and `skip_locked` work.
+- Regular expressions have no backreferences.
+- The server knows UTC and fixed offsets only. For a named `TIME_ZONE` the backend computes the
+  offsets itself from Python's zone database, for 1970 to 2050.
+- With `USE_TZ = False`, `DateTimeField` is a `timestamp` column and aware datetimes are refused.
+- An existing column cannot become an `AutoField`, and `SHA1()` is not available.
+- Renaming a column drops and declares again the indexes and constraints that name it, since the
+  server refuses the rename otherwise. An index made outside Django with an expression or a
+  condition on that column has to be dropped by hand first.
+- Expression indexes, index column order, column collations and comments are not read back by
+  introspection.
+- Tables whose names start with `nusadb_` do not appear in `information_schema`, so do not give a
+  Django app a label starting with `nusadb_`.
+- Not supported by the server yet: a subquery in `GROUP BY` (grouping by a `Subquery` or `Exists`
+  annotation), bitwise operators on `bigint`, dividing an interval, set operations inside a
+  subquery, and `OFFSET` on a combined query.
+
 ## Tests
 
 The tests start a real `nusadb-server`. Point them at one with `NUSADB_SERVER_BIN`; without it they
@@ -420,6 +468,9 @@ look for a build beside this checkout, and skip when there is none.
 ```bash
 NUSADB_SERVER_BIN=/path/to/nusadb-server python -m unittest discover -s tests
 ```
+
+The Django backend's tests in `tests/django` run as part of that when Django is installed. They
+start their own server on a free port between 5700 and 5799.
 
 ## License
 

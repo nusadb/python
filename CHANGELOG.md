@@ -36,6 +36,9 @@
   `ipaddress` values, `VECTOR` to a list of floats, and each binds back as a parameter
   (`nusadb.Vector` for a vector). `nusadb.parse_record` splits a composite value's text. The other
   types the server reports by name (`MACADDR`, `BIT`, geometric, full-text, `XML`) keep their text.
+- `nusadb.django`, a Django database backend (Django 4.2): migrations, the ORM's queries, JSON
+  lookups, `select_for_update`, savepoints, introspection for `inspectdb`, test databases made
+  with `CREATE DATABASE`, and `dbshell` through `nusadb-cli`. Install with `nusadb[django]`.
 - `conn.pipeline()`: send a group of statements in one round trip and read each result from its
   cursor afterwards, sync and asyncio.
 - Named cursors (`conn.cursor(name=..., scrollable=..., withhold=...)`): the query stays on the
