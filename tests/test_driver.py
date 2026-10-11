@@ -211,6 +211,44 @@ class TrustServerTests(unittest.TestCase):
 
         conn.close()
 
+    def test_copy_rows_in_and_out(self) -> None:
+        import datetime as dt
+
+        conn = self._connect()
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE TABLE copy_r (id INT PRIMARY KEY, name TEXT, tags INT[], doc JSON, "
+            "raw BYTEA, born DATE)"
+        )
+        awkward = "tab\there\nnew line, back\\slash and \\N"
+
+        def rows():
+            yield (1, awkward, [1, 2], {"k": "v"}, b"\x00\xff", dt.date(2026, 1, 2))
+            yield (2, None, None, None, None, None)
+            for i in range(3, 3003):
+                yield (i, "x" * 40, [i], None, None, None)
+
+        self.assertEqual(conn.copy_in_rows("COPY copy_r FROM STDIN", rows()), 3002)
+        cur.execute("SELECT name, tags, doc, raw, born FROM copy_r WHERE id = 1")
+        self.assertEqual(
+            cur.fetchone(), (awkward, [1, 2], {"k": "v"}, b"\x00\xff", dt.date(2026, 1, 2))
+        )
+
+        out = conn.copy_out_rows("COPY (SELECT id, name, tags FROM copy_r ORDER BY id) TO STDOUT")
+        self.assertEqual(len(out), 3002)
+        self.assertEqual(out[0], ("1", awkward, "{1,2}"))
+        self.assertEqual(out[1], ("2", None, None))
+        self.assertEqual(out[-1], ("3002", "x" * 40, "{3002}"))
+
+        # A row that cannot be written loads nothing and leaves the connection usable.
+        with self.assertRaises(nusadb.ProgrammingError):
+            conn.copy_in_rows("COPY copy_r FROM STDIN", [(9001, "a"), "not a row"])
+        with self.assertRaises(nusadb.ProgrammingError):
+            conn.copy_in_rows("COPY copy_r FROM STDIN", [(9002, {1, 2})])
+        cur.execute("SELECT count(*) FROM copy_r")
+        self.assertEqual(cur.fetchone(), (3002,))
+        conn.close()
+
     def test_bytea_round_trip(self) -> None:
         conn = self._connect()
         cur = conn.cursor()

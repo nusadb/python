@@ -29,6 +29,20 @@
 
 ### Added
 
+- `pyformat` placeholders: `%s` by position and `%(name)s` from a mapping (a name may repeat),
+  with `%%` for a literal `%`, in `execute`, `executemany`, prepared statements and `stream`, sync
+  and asyncio alike. The native `$1` and the `numeric` `:1` work as before.
+- Range, network and vector types: a range decodes to `nusadb.Range`, `INET` and `CIDR` to
+  `ipaddress` values, `VECTOR` to a list of floats, and each binds back as a parameter
+  (`nusadb.Vector` for a vector). `nusadb.parse_record` splits a composite value's text. The other
+  types the server reports by name (`MACADDR`, `BIT`, geometric, full-text, `XML`) keep their text.
+- `conn.pipeline()`: send a group of statements in one round trip and read each result from its
+  cursor afterwards, sync and asyncio.
+- Named cursors (`conn.cursor(name=..., scrollable=..., withhold=...)`): the query stays on the
+  server and rows are fetched as they are read, with `scroll()`, `rownumber` and `itersize`, sync
+  and asyncio. Parameters in a named cursor's query need a server that binds them in `DECLARE`.
+- `conn.copy_in_rows(sql, rows)` and `conn.copy_out_rows(sql)`: `COPY` with Python rows instead of
+  preformatted bytes, sync and asyncio.
 - Connection URLs and the `connect_timeout`, `statement_timeout` and `keepalive` options; TLS from
   the URL (`nusadbs://`, `tls`, `tls_ca`, `tls_cert`, `tls_key`).
 - `conn.transaction(isolation=..., read_only=...)`: a block that commits or rolls back, nesting
@@ -57,6 +71,8 @@
 - A `Decimal` in exponent form (`Decimal("1E+3")`) binds as its value, an `IntEnum` member as its
   number, and a mapping inside a list as JSON.
 - A copy in the wrong direction (`copy_out` on `COPY ... FROM STDIN`) raises instead of hanging.
+- In `nusadb.aio`, a `copy_in` source that raises a database error ends the `COPY` cleanly instead of
+  leaving the connection out of step.
 - A call interrupted part way, including `poll`, marks the connection broken instead of leaving
   it out of step with the server.
 - The pool no longer takes back a connection returned after `close()`, nor opens one for a checkout

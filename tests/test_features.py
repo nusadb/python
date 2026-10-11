@@ -392,3 +392,485 @@ class AdapterTests(_ServerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PyformatParameterTests(_ServerCase):
+    def test_percent_s_binds_by_position(self) -> None:
+        cur = self.connect().cursor()
+        cur.execute("SELECT %s, %s + 1, '%s' AS text_kept", ["007", 41])
+        self.assertEqual(cur.fetchone(), ("007", 42, "%s"))
+
+    def test_named_markers_bind_from_a_mapping_and_may_repeat(self) -> None:
+        cur = self.connect().cursor()
+        cur.execute("SELECT %(a)s, %(b)s, %(a)s", {"b": "two", "a": 1})
+        self.assertEqual(cur.fetchone(), (1, "two", 1))
+
+    def test_double_percent_is_a_literal_percent(self) -> None:
+        cur = self.connect().cursor()
+        cur.execute("SELECT 10 %% 3, %s", [5])
+        self.assertEqual(cur.fetchone(), (1, 5))
+        # A query on native markers keeps its % as written, even where it reads like %s.
+        cur.execute("SELECT $1 % 3", [10])
+        self.assertEqual(cur.fetchone(), (1,))
+        cur.execute("SELECT $1, 10 %s FROM (SELECT 3 AS s) AS t", [0])
+        self.assertEqual(cur.fetchone(), (0, 1))
+
+    def test_markers_in_strings_and_comments_are_left_alone(self) -> None:
+        cur = self.connect().cursor()
+        cur.execute("SELECT %s /* %(x)s */, $$ %s $$ -- %s\n", [1])
+        self.assertEqual(cur.fetchone(), (1, " %s "))
+
+    def test_a_mismatch_is_refused_before_anything_runs(self) -> None:
+        conn = self.connect()
+        cur = conn.cursor()
+        for sql, params, message in [
+            ("SELECT %s, %(a)s", {"a": 1}, "not both"),
+            ("SELECT %s, %s", [1], "2 %s placeholder"),
+            ("SELECT %(a)s", {"b": 1}, "no parameter named 'a'"),
+            ("SELECT %(a)s", [1], "take a mapping"),
+            ("SELECT $1", {"a": 1}, r"needs %\(name\)s"),
+        ]:
+            with self.assertRaisesRegex(nusadb.ProgrammingError, message):
+                cur.execute(sql, params)
+        self.assertEqual(conn.transaction_status, "idle")
+        cur.execute("SELECT 1")
+        self.assertEqual(cur.fetchone(), (1,))
+
+    def test_executemany_prepare_and_stream_take_mappings(self) -> None:
+        conn = self.connect()
+        self.table(conn, "pf", "id INT PRIMARY KEY, name TEXT")
+        cur = conn.cursor()
+        cur.executemany(
+            "INSERT INTO pf VALUES (%(id)s, %(name)s)",
+            [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}, {"name": "c", "id": 3}],
+        )
+        self.assertEqual(cur.rowcount, 3)
+        statement = conn.prepare("SELECT name FROM pf WHERE id = %(id)s")
+        cur.execute(statement, {"id": 2})
+        self.assertEqual(cur.fetchone(), ("b",))
+        cur.executemany(conn.prepare("UPDATE pf SET name = %s WHERE id = %s"), [["x", 1], ["y", 3]])
+        with conn.stream("SELECT id, name FROM pf WHERE id >= %(low)s ORDER BY id", {"low": 2}) as rows:
+            self.assertEqual(list(rows), [(2, "b"), (3, "y")])
+
+    def test_a_bad_row_in_executemany_stops_after_the_rows_before_it(self) -> None:
+        conn = self.connect()
+        self.table(conn, "pfr")
+        cur = conn.cursor()
+        with self.assertRaisesRegex(nusadb.ProgrammingError, "no parameter named 'id'"):
+            cur.executemany("INSERT INTO pfr VALUES (%(id)s)", [{"id": 1}, {"other": 2}])
+        self.assertEqual(self.values(conn, "SELECT id FROM pfr"), [1])
+
+
+class PipelineTests(_ServerCase):
+    def test_results_arrive_in_their_cursors(self) -> None:
+        conn = self.connect()
+        self.table(conn, "pl", "id INT PRIMARY KEY, v TEXT")
+        with conn.pipeline() as p:
+            ins = p.execute("INSERT INTO pl VALUES ($1, $2), ($3, $4)", [1, "a", 2, "b"])
+            sel = p.execute("SELECT v FROM pl WHERE id = %(id)s", {"id": 2})
+            upd = p.execute("UPDATE pl SET v = 'z' WHERE id > 0")
+            self.assertEqual(sel.fetchall(), [])  # nothing has been sent yet
+        self.assertEqual(ins.rowcount, 2)
+        self.assertEqual(sel.fetchall(), [("b",)])
+        self.assertEqual(sel.description[0][:2], ("v", "TEXT"))
+        self.assertEqual(upd.rowcount, 2)
+
+    def test_one_round_trip_for_the_block(self) -> None:
+        conn = self.connect()
+        sends = []
+        real_send = conn._send
+        conn._send = lambda frame: (sends.append(frame), real_send(frame))[1]
+        with conn.pipeline() as p:
+            cursors = [p.execute("SELECT $1", [i]) for i in range(10)]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual([c.fetchone() for c in cursors], [(i,) for i in range(10)])
+
+    def test_a_long_pipeline_syncs_on_its_own(self) -> None:
+        conn = self.connect()
+        with conn.pipeline() as p:
+            cursors = [p.execute("SELECT $1", [i]) for i in range(nusadb.PIPELINE_SYNC_STATEMENTS + 1)]
+            # The first full queue has been sent and read; the last statement is still queued.
+            self.assertEqual(cursors[0].fetchone(), (0,))
+            self.assertEqual(cursors[-1].fetchone(), None)
+        self.assertEqual(cursors[-1].fetchone(), (nusadb.PIPELINE_SYNC_STATEMENTS,))
+
+    def test_a_failure_skips_the_rest_and_raises(self) -> None:
+        conn = self.connect()
+        self.table(conn, "pf")
+        with self.assertRaises(nusadb.ProgrammingError):
+            with conn.pipeline() as p:
+                first = p.execute("INSERT INTO pf VALUES (1)")
+                p.execute("SELECT nope FROM pf")
+                skipped = p.execute("INSERT INTO pf VALUES (2)")
+        self.assertEqual(first.rowcount, 1)
+        self.assertEqual(skipped.rowcount, -1)
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM pf")
+        self.assertEqual(cur.fetchall(), [(1,)])
+
+    def test_an_exception_in_the_block_sends_nothing(self) -> None:
+        conn = self.connect()
+        self.table(conn, "pe")
+        with self.assertRaises(KeyError):
+            with conn.pipeline() as p:
+                p.execute("INSERT INTO pe VALUES (1)")
+                raise KeyError("stop")
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM pe")
+        self.assertEqual(cur.fetchone(), (0,))
+
+    def test_the_connection_waits_for_queued_statements(self) -> None:
+        conn = self.connect()
+        with conn.pipeline() as p:
+            p.execute("SELECT 1")
+            with self.assertRaises(nusadb.InterfaceError):
+                conn.cursor().execute("SELECT 2")
+            p.sync()
+            cur = conn.cursor()
+            cur.execute("SELECT 2")
+            self.assertEqual(cur.fetchone(), (2,))
+            with self.assertRaises(nusadb.ProgrammingError):
+                with conn.pipeline():
+                    pass
+        with self.assertRaises(nusadb.ProgrammingError):
+            p.execute("SELECT 3")
+
+    def test_a_transaction_holds_the_pipeline(self) -> None:
+        conn = self.connect()
+        self.table(conn, "pt")
+        conn.autocommit = False
+        with conn.pipeline() as p:
+            p.execute("INSERT INTO pt VALUES (1)")
+            p.execute("INSERT INTO pt VALUES (2)")
+        self.assertEqual(conn.transaction_status, "in_transaction")
+        conn.rollback()
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM pt")
+        self.assertEqual(cur.fetchone(), (0,))
+
+
+class ServerCursorTests(_ServerCase):
+    def rows_table(self, conn: nusadb.Connection, name: str, count: int = 25) -> None:
+        self.table(conn, name, "id INT PRIMARY KEY, v TEXT")
+        cur = conn.cursor()
+        cur.execute(f"INSERT INTO {name} SELECT g, 'v' || g FROM generate_series(1, {count}) g")
+        conn.commit()
+
+    def fetches(self, conn: nusadb.Connection) -> list:
+        sent = []
+        real_send = conn._send
+        conn._send = lambda frame: (sent.append(frame), real_send(frame))[1]
+        return sent
+
+    def test_rows_come_over_as_they_are_fetched(self) -> None:
+        conn = self.connect(autocommit=False)
+        self.rows_table(conn, "sc1")
+        cur = conn.cursor(name="c1")
+        cur.execute("SELECT id, v FROM sc1 ORDER BY id")
+        self.assertIsNone(cur.description)
+        self.assertEqual(cur.fetchone(), (1, "v1"))
+        self.assertEqual(cur.description[0][:2], ("id", "INT"))
+        self.assertEqual(cur.fetchmany(3), [(2, "v2"), (3, "v3"), (4, "v4")])
+        self.assertEqual((cur.rownumber, cur.rowcount), (4, 4))
+        rest = cur.fetchall()
+        self.assertEqual([r[0] for r in rest], list(range(5, 26)))
+        self.assertEqual((cur.rownumber, cur.rowcount), (25, 25))
+        self.assertIsNone(cur.fetchone())
+        self.assertEqual(cur.fetchmany(5), [])
+        cur.close()
+
+    def test_iteration_fetches_itersize_rows_at_a_time(self) -> None:
+        conn = self.connect(autocommit=False)
+        self.rows_table(conn, "sc2")
+        cur = conn.cursor(name="c2")
+        cur.itersize = 7
+        cur.execute("SELECT id FROM sc2 ORDER BY id")
+        sent = self.fetches(conn)
+        self.assertEqual([row[0] for row in cur], list(range(1, 26)))
+        self.assertEqual(sum(b"FETCH FORWARD 7" in frame for frame in sent), 5)
+        # A fetch after iteration started serves the buffered rows first, and asks the server only
+        # for the rest.
+        cur.execute("SELECT id FROM sc2 ORDER BY id")
+        self.assertEqual(next(iter(cur)), (1,))
+        self.assertEqual(cur.fetchmany(2), [(2,), (3,)])
+        self.assertEqual(cur.fetchone(), (4,))
+        sent.clear()
+        self.assertEqual([r[0] for r in cur.fetchmany(6)], [5, 6, 7, 8, 9, 10])
+        self.assertTrue(any(b"FETCH FORWARD 3" in frame for frame in sent), sent)
+        self.assertEqual(next(cur), (11,))
+        self.assertEqual([r[0] for r in cur.fetchall()], list(range(12, 26)))
+        # Exhausted, the cursor still describes its columns.
+        self.assertIsNone(cur.fetchone())
+        self.assertEqual(cur.description[0][0], "id")
+        # A scroll drops what was buffered.
+        cur.execute("SELECT id FROM sc2 ORDER BY id")
+        self.assertEqual(next(cur), (1,))
+        cur.scroll(5, "absolute")
+        self.assertEqual(cur.fetchone(), (6,))
+
+    def test_scroll_moves_within_the_result(self) -> None:
+        conn = self.connect(autocommit=False)
+        self.rows_table(conn, "sc3")
+        cur = conn.cursor(name="c3", scrollable=True)
+        cur.execute("SELECT id FROM sc3 ORDER BY id")
+        self.assertEqual(cur.fetchmany(5)[-1], (5,))
+        cur.scroll(-2)
+        self.assertEqual((cur.rownumber, cur.fetchone()), (3, (4,)))
+        cur.scroll(20, "absolute")
+        self.assertEqual(cur.fetchone(), (21,))
+        cur.scroll(0, "absolute")
+        self.assertEqual(cur.fetchone(), (1,))
+        cur.scroll(24, "absolute")
+        self.assertEqual(cur.fetchall(), [(25,)])
+        cur.scroll(-25)
+        self.assertEqual(cur.rownumber, 0)
+        cur.scroll(3)
+        with self.assertRaises(IndexError):
+            cur.scroll(30, "absolute")
+        self.assertEqual((cur.rownumber, cur.fetchone()), (3, (4,)))
+        with self.assertRaises(IndexError):
+            cur.scroll(-10)
+        self.assertEqual(cur.fetchone(), (5,))
+        with self.assertRaises(nusadb.ProgrammingError):
+            cur.scroll(1, "sideways")
+        cur.execute("SELECT id FROM sc3 WHERE id > 23 ORDER BY id")
+        self.assertEqual(cur.fetchall(), [(24,), (25,)])
+
+    def test_a_query_takes_parameters(self) -> None:
+        conn = self.connect(autocommit=False)
+        self.rows_table(conn, "sc4")
+        cur = conn.cursor(name="c4")
+        cur.execute("SELECT v FROM sc4 WHERE id > %s ORDER BY id", (22,))
+        self.assertEqual(cur.fetchall(), [("v23",), ("v24",), ("v25",)])
+
+    def test_a_cursor_lives_as_long_as_its_transaction_unless_held(self) -> None:
+        conn = self.connect(autocommit=False)
+        self.rows_table(conn, "sc5", 3)
+        held = conn.cursor(name="held", withhold=True)
+        held.execute("SELECT id FROM sc5 ORDER BY id")
+        plain = conn.cursor(name="plain")
+        plain.execute("SELECT id FROM sc5 ORDER BY id")
+        conn.commit()
+        self.assertEqual(held.fetchall(), [(1,), (2,), (3,)])
+        conn.commit()
+        with self.assertRaises(nusadb.ProgrammingError):
+            plain.fetchone()
+        conn.rollback()
+        # A held cursor declared in a transaction that rolled back is gone; closing it is quiet.
+        lost = conn.cursor(name="lost", withhold=True)
+        lost.execute("SELECT id FROM sc5")
+        conn.rollback()
+        lost.close()
+        # Closing a cursor its transaction already closed sends nothing, so no transaction opens.
+        sent = self.fetches(conn)
+        plain.close()
+        self.assertEqual(sent, [])
+        held.close()
+        self.assertEqual(conn.transaction_status, "idle")
+        with self.assertRaises(nusadb.ProgrammingError):
+            held.fetchone()
+
+    def test_autocommit_needs_a_held_cursor(self) -> None:
+        conn = self.connect(autocommit=True)
+        self.rows_table(conn, "sc6", 2)
+        with self.assertRaises(nusadb.OperationalError) as caught:
+            conn.cursor(name="c6").execute("SELECT id FROM sc6")
+        self.assertEqual(caught.exception.sqlstate, "25P01")
+        held = conn.cursor(name="c6", withhold=True)
+        held.execute("SELECT id FROM sc6 ORDER BY id")
+        self.assertEqual(held.fetchall(), [(1,), (2,)])
+        held.close()
+
+    def test_close_in_a_failed_transaction_and_redeclare(self) -> None:
+        conn = self.connect(autocommit=False)
+        self.rows_table(conn, "sc7", 2)
+        cur = conn.cursor(name="c7")
+        cur.execute("SELECT id FROM sc7")
+        cur.execute("SELECT id FROM sc7 WHERE id = 2")  # the first is closed, not a 42P03
+        self.assertEqual(cur.fetchall(), [(2,)])
+        with self.assertRaises(nusadb.ProgrammingError):
+            conn.cursor().execute("SELECT nope FROM sc7")
+        cur.close()  # in a failed transaction: nothing sent, no error
+        conn.rollback()
+        with self.assertRaises(nusadb.ProgrammingError):
+            conn.cursor(name="c8").fetchone()
+        with self.assertRaises(nusadb.NotSupportedError):
+            conn.cursor(name="c8").executemany("SELECT 1", [()])
+
+
+class PlaceholderCompileTests(unittest.TestCase):
+    def test_a_repeated_name_is_one_parameter(self) -> None:
+        compiled = connection_module._compile("SELECT %(a)s, %(b)s, %(a)s")
+        self.assertEqual(compiled.sql, "SELECT $1, $2, $1")
+        self.assertEqual(compiled.names, ["a", "b"])
+
+    def test_an_empty_mapping_is_no_parameters(self) -> None:
+        compiled = connection_module._compile("SELECT 1")
+        self.assertEqual(connection_module._arrange(compiled, {}), ())
+        with self.assertRaises(nusadb.ProgrammingError):
+            connection_module._arrange(compiled, {"a": 1})
+
+    def test_a_numeric_marker_keeps_a_percent_as_written(self) -> None:
+        self.assertEqual(connection_module._compile("SELECT 7 % :1").sql, "SELECT 7 % $1")
+
+    def test_a_native_marker_before_a_dollar_quote_stays_a_marker(self) -> None:
+        spans = connection_module._sql_spans("SELECT $1$$x$$")
+        self.assertEqual(spans, [(True, "SELECT $1"), (False, "$$x$$")])
+
+
+class TypeTextTests(unittest.TestCase):
+    def test_a_range_bound_with_a_separator_is_quoted_and_reads_back(self) -> None:
+        r = nusadb.Range("a, b", 'say "hi"', "[]")
+        self.assertEqual(str(r), '["a, b","say \\"hi\\""]')
+        self.assertEqual(nusadb.types.decode_range(str(r)), r)
+        self.assertEqual(nusadb.types.decode_range('["x ""y""",)'), nusadb.Range('x "y"', None))
+
+    def test_a_short_offset_in_a_range_bound_is_read(self) -> None:
+        import datetime as dt
+
+        r = nusadb.types.decode_range('["2026-01-01 10:00:00+05","2026-01-02 00:00:00+0530")')
+        self.assertEqual(r.lower.utcoffset(), dt.timedelta(hours=5))
+        self.assertEqual(r.upper.utcoffset(), dt.timedelta(hours=5, minutes=30))
+
+    def test_membership_honours_exclusive_bounds(self) -> None:
+        r = nusadb.Range(1, 10, "()")
+        self.assertNotIn(1, r)
+        self.assertNotIn(10, r)
+        self.assertIn(2, r)
+        self.assertIn(10, nusadb.Range(1, 10, "(]"))
+
+    def test_a_single_host_inet_is_an_address(self) -> None:
+        import ipaddress
+
+        self.assertEqual(nusadb.types.decode_inet("10.0.0.1/32"), ipaddress.ip_address("10.0.0.1"))
+        self.assertEqual(nusadb.types.decode_inet("::1/128"), ipaddress.ip_address("::1"))
+        self.assertEqual(
+            nusadb.types.decode_inet("10.0.0.1/8"), ipaddress.ip_interface("10.0.0.1/8")
+        )
+
+    def test_a_record_keeps_empty_strings_apart_from_nulls(self) -> None:
+        self.assertEqual(nusadb.parse_record('(,"",x)'), (None, "", "x"))
+        self.assertEqual(nusadb.parse_record('("a ""q"" b")'), ('a "q" b',))
+
+
+class CopyTextTests(unittest.TestCase):
+    def test_rows_are_sent_in_bounded_chunks(self) -> None:
+        rows = [(i, "x" * 100) for i in range(2000)]
+        chunks = list(connection_module._copy_text_chunks(rows))
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(c) < connection_module._COPY_CHUNK + 200 for c in chunks))
+        self.assertEqual(b"".join(chunks).count(b"\n"), 2000)
+
+    def test_a_row_cut_across_chunks_is_joined(self) -> None:
+        lines = connection_module._CopyLines()
+        for chunk in (b"1\tab", b"c\n2\t\\", b"N\n3\tz"):
+            lines(chunk)
+        self.assertEqual(lines.finish(), [("1", "abc"), ("2", None), ("3", "z")])
+
+    def test_async_rows_are_sent_in_batches(self) -> None:
+        import asyncio
+
+        from nusadb import aio
+
+        async def rows():
+            for i in range(2500):
+                yield (i,)
+
+        async def collect():
+            return [c async for c in aio._async_copy_text_chunks(rows())]
+
+        chunks = asyncio.run(collect())
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(b"".join(chunks).count(b"\n"), 2500)
+
+
+class MoreTypeTests(_ServerCase):
+    def test_ranges_decode_and_bind(self) -> None:
+        import datetime as dt
+
+        conn = self.connect()
+        self.table(conn, "rg", "id INT PRIMARY KEY, i INT4RANGE, n NUMRANGE, d DATERANGE, t TSRANGE")
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO rg VALUES ($1, $2, $3, $4, $5)",
+            [
+                1,
+                nusadb.Range(1, 10),
+                nusadb.Range(Decimal("1.5"), None, "(]"),
+                nusadb.Range(dt.date(2026, 1, 1), dt.date(2026, 2, 1)),
+                nusadb.Range(dt.datetime(2026, 1, 1, 10), dt.datetime(2026, 1, 2)),
+            ],
+        )
+        cur.execute("INSERT INTO rg (id, i) VALUES (2, int4range(5, 5)), (3, int4range(1, 3, '[]'))")
+        cur.execute("SELECT i, n, d, t FROM rg WHERE id = 1")
+        i, n, d, t = cur.fetchone()
+        self.assertEqual(i, nusadb.Range(1, 10))
+        self.assertTrue(5 in i and 10 not in i)
+        self.assertEqual((n.lower, n.upper, n.bounds), (Decimal("1.5"), None, "()"))
+        self.assertTrue(n.upper_inf)
+        self.assertEqual(d, nusadb.Range(dt.date(2026, 1, 1), dt.date(2026, 2, 1)))
+        self.assertEqual(t.lower, dt.datetime(2026, 1, 1, 10))
+        self.assertEqual(cur.description[0][1], "RANGE")
+        cur.execute("SELECT i FROM rg WHERE id IN (2, 3) ORDER BY id")
+        empty, closed = (row[0] for row in cur.fetchall())
+        self.assertTrue(empty.isempty)
+        self.assertEqual(closed, nusadb.Range(1, 4))
+        cur.execute("SELECT id FROM rg WHERE i @> $1 ORDER BY id", [2])
+        self.assertEqual(cur.fetchall(), [(1,), (3,)])
+
+    def test_network_addresses_decode_and_bind(self) -> None:
+        import ipaddress
+
+        conn = self.connect()
+        self.table(conn, "net", "id INT PRIMARY KEY, a INET, n CIDR, m MACADDR")
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO net VALUES (1, $1, $2, '08:00:2b:01:02:03'), (2, $3, NULL, NULL)",
+            [
+                ipaddress.ip_interface("192.168.1.5/24"),
+                ipaddress.ip_network("10.0.0.0/8"),
+                ipaddress.ip_address("::1"),
+            ],
+        )
+        cur.execute("SELECT a, n, m FROM net ORDER BY id")
+        rows = cur.fetchall()
+        self.assertEqual(rows[0][0], ipaddress.ip_interface("192.168.1.5/24"))
+        self.assertEqual(rows[0][1], ipaddress.ip_network("10.0.0.0/8"))
+        self.assertEqual(rows[0][2], "08:00:2b:01:02:03")
+        self.assertEqual(rows[1][0], ipaddress.ip_address("::1"))
+        self.assertEqual([d[1] for d in cur.description], ["INET", "CIDR", "MACADDR"])
+        cur.execute("SELECT id FROM net WHERE n >> $1", [ipaddress.ip_address("10.1.2.3")])
+        self.assertEqual(cur.fetchall(), [(1,)])
+        # A network binds as CIDR and an address as INET, not as text.
+        cur.execute("SELECT $1, $2", [ipaddress.ip_network("10.0.0.0/8"), ipaddress.ip_address("10.1.2.3")])
+        self.assertEqual(
+            cur.fetchone(), (ipaddress.ip_network("10.0.0.0/8"), ipaddress.ip_address("10.1.2.3"))
+        )
+        self.assertEqual([d[1] for d in cur.description], ["CIDR", "INET"])
+
+    def test_vectors_decode_and_bind(self) -> None:
+        conn = self.connect()
+        self.table(conn, "vec", "id INT PRIMARY KEY, v VECTOR(3)")
+        cur = conn.cursor()
+        cur.execute("INSERT INTO vec VALUES (1, $1)", [nusadb.Vector([1, 2.5, -3])])
+        cur.execute("SELECT v FROM vec")
+        self.assertEqual(cur.fetchone(), ([1.0, 2.5, -3.0],))
+
+    def test_other_types_keep_their_text_and_name(self) -> None:
+        cur = self.connect().cursor()
+        cur.execute(
+            "SELECT B'101', '(1,2)'::POINT, to_tsvector('the cat'), '<a/>'::XML, "
+            "'08:00:2b:01:02:03:04:05'::MACADDR8"
+        )
+        self.assertEqual(cur.fetchone(), ("101", "(1,2)", "'cat':2", "<a/>", "08:00:2b:01:02:03:04:05"))
+        self.assertEqual(
+            [d[1] for d in cur.description], ["BIT", "GEOMETRY", "TSVECTOR", "XML", "MACADDR8"]
+        )
+
+    def test_a_composite_value_splits_into_its_fields(self) -> None:
+        conn = self.connect()
+        cur = conn.cursor()
+        cur.execute("DROP TYPE IF EXISTS pair")
+        cur.execute("CREATE TYPE pair AS (a INT, b TEXT, c TEXT)")
+        cur.execute("SELECT ROW(1, 'a, b', NULL)::pair")
+        self.assertEqual(nusadb.parse_record(cur.fetchone()[0]), ("1", "a, b", None))

@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import nusadb  # noqa: E402
 from test_driver import _Server  # noqa: E402
 
 try:
@@ -334,9 +335,14 @@ class SqlAlchemyTests(unittest.TestCase):
             conn.invalidate()
 
     def test_views_and_schemas(self) -> None:
+        # Creating a schema needs the CREATEDB attribute, which the superuser has.
+        admin = nusadb.connect(port=self.server.port, user="nusadb-root", password=None)
+        try:
+            admin.cursor().execute("CREATE SCHEMA IF NOT EXISTS sa_other")
+            admin.cursor().execute("CREATE TABLE IF NOT EXISTS sa_other.t (id INT PRIMARY KEY)")
+        finally:
+            admin.close()
         with self.engine.begin() as conn:
-            conn.exec_driver_sql("CREATE SCHEMA IF NOT EXISTS sa_other")
-            conn.exec_driver_sql("CREATE TABLE IF NOT EXISTS sa_other.t (id INT PRIMARY KEY)")
             conn.exec_driver_sql("CREATE OR REPLACE VIEW sa_view AS SELECT id FROM sa_plain")
         insp = inspect(self.engine)
         self.assertIn("sa_other", insp.get_schema_names())

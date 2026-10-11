@@ -291,6 +291,83 @@ class CopyNotifyPoolTests(_AsyncCase):
             await conn.copy_out("COPY c FROM STDIN", out.append)
         self.assertEqual(await self.values(conn, "SELECT count(*) FROM c"), [5])
 
+    async def test_copy_rows_in_and_out(self) -> None:
+        conn = await self.connect()
+        await conn.execute("CREATE TABLE cr (id INT, v TEXT)")
+        self.assertEqual(await conn.copy_in_rows("COPY cr FROM STDIN", [(1, "a\tb"), (2, None)]), 2)
+
+        async def rows():
+            for i in range(3, 1503):
+                yield (i, "y")
+
+        self.assertEqual(await conn.copy_in_rows("COPY cr FROM STDIN", rows()), 1500)
+        out = await conn.copy_out_rows("COPY (SELECT id, v FROM cr ORDER BY id) TO STDOUT")
+        self.assertEqual(out[:2], [("1", "a\tb"), ("2", None)])
+        self.assertEqual(len(out), 1502)
+        with self.assertRaises(nusadb.ProgrammingError):
+            await conn.copy_in_rows("COPY cr FROM STDIN", [(5, "z"), 7])
+        self.assertEqual(await self.values(conn, "SELECT count(*) FROM cr"), [1502])
+
+    async def test_pipeline(self) -> None:
+        conn = await self.connect()
+        await conn.execute("CREATE TABLE ap (id INT PRIMARY KEY)")
+        async with conn.pipeline() as p:
+            ins = await p.execute("INSERT INTO ap VALUES ($1), ($2)", [1, 2])
+            sel = await p.execute("SELECT id FROM ap ORDER BY id")
+            upd = await p.execute("UPDATE ap SET id = id WHERE id > 100")
+        self.assertEqual(ins.rowcount, 2)
+        self.assertEqual(await sel.fetchall(), [(1,), (2,)])
+        self.assertEqual((upd.rowcount, upd.description), (0, None))
+        with self.assertRaises(nusadb.ProgrammingError):
+            async with conn.pipeline() as p:
+                await p.execute("INSERT INTO ap VALUES (3)")
+                await p.execute("SELECT nope FROM ap")
+                skipped = await p.execute("INSERT INTO ap VALUES (4)")
+        self.assertEqual(skipped.rowcount, -1)
+        async with conn.pipeline() as p:
+            many = [await p.execute("SELECT $1", [i]) for i in range(nusadb.PIPELINE_SYNC_STATEMENTS + 1)]
+            self.assertEqual(await many[0].fetchone(), (0,))
+        self.assertEqual(await many[-1].fetchone(), (nusadb.PIPELINE_SYNC_STATEMENTS,))
+        with self.assertRaises(KeyError):
+            async with conn.pipeline() as p:
+                await p.execute("INSERT INTO ap VALUES (9)")
+                raise KeyError("stop")
+        self.assertEqual(await self.values(conn, "SELECT id FROM ap ORDER BY id"), [1, 2, 3])
+
+    async def test_named_cursor(self) -> None:
+        conn = await self.connect()
+        await conn.execute("CREATE TABLE nc (id INT PRIMARY KEY)")
+        await conn.execute("INSERT INTO nc SELECT g FROM generate_series(1, 20) g")
+        cur = conn.cursor(name="anc", scrollable=True, withhold=True)
+        await cur.execute("SELECT id FROM nc WHERE id > $1 ORDER BY id", [2])
+        self.assertEqual(await cur.fetchone(), (3,))
+        self.assertEqual(await cur.fetchmany(2), [(4,), (5,)])
+        await cur.scroll(-3)
+        self.assertEqual(cur.rownumber, 0)
+        cur.itersize = 4
+        sent = []
+        real_send = conn._send
+        conn._send = lambda frame: (sent.append(frame), real_send(frame))[1]
+        self.assertEqual([row[0] async for row in cur], list(range(3, 21)))
+        self.assertEqual(sum(b"FETCH FORWARD 4" in frame for frame in sent), 6)
+        await cur.scroll(2, "absolute")
+        with self.assertRaises(IndexError):
+            await cur.scroll(50, "absolute")
+        self.assertEqual(await cur.fetchone(), (5,))
+        await cur.scroll(0, "absolute")
+        self.assertEqual(await cur.__anext__(), (3,))
+        await cur.scroll(9, "absolute")
+        self.assertEqual(await cur.fetchone(), (12,))
+        self.assertEqual(await cur.__anext__(), (13,))
+        self.assertEqual([r[0] for r in await cur.fetchall()], list(range(14, 21)))
+        await cur.scroll(17, "absolute")
+        self.assertEqual(await cur.fetchall(), [(20,)])
+        await cur.close()
+        with self.assertRaises(nusadb.ProgrammingError):
+            await cur.fetchone()
+        with self.assertRaises(nusadb.OperationalError):
+            await conn.cursor(name="plain").execute("SELECT 1")
+
     async def test_listen_notify(self) -> None:
         listener = await self.connect()
         sender = await self.connect()
@@ -334,3 +411,22 @@ class CopyNotifyPoolTests(_AsyncCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PyformatTests(_AsyncCase):
+    async def test_named_and_positional_markers(self) -> None:
+        conn = await self.connect()
+        cur = await conn.execute("SELECT %(a)s, %(b)s, %(a)s", {"a": 1, "b": "x"})
+        self.assertEqual(await cur.fetchone(), (1, "x", 1))
+        cur = await conn.execute("SELECT %s, 7 %% 4", [3])
+        self.assertEqual(await cur.fetchone(), (3, 3))
+        await conn.execute("CREATE TABLE apf (id INT PRIMARY KEY)")
+        await conn.cursor().executemany("INSERT INTO apf VALUES (%(id)s)", [{"id": 1}, {"id": 2}])
+        statement = await conn.prepare("SELECT count(*) FROM apf WHERE id >= %(low)s")
+        cur = conn.cursor()
+        await cur.execute(statement, {"low": 2})
+        self.assertEqual(await cur.fetchone(), (1,))
+        async with conn.stream("SELECT id FROM apf WHERE id > %s ORDER BY id", [0]) as rows:
+            self.assertEqual([row async for row in rows], [(1,), (2,)])
+        with self.assertRaisesRegex(nusadb.ProgrammingError, "take a mapping"):
+            await conn.execute("SELECT %(a)s", [1])

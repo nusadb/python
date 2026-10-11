@@ -29,10 +29,12 @@ import time
 from collections import OrderedDict
 from typing import (
     Any,
+    AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
     Dict,
+    Iterable,
     List,
     NamedTuple,
     Optional,
@@ -50,18 +52,26 @@ from .connection import (
     Notification,
     RowFactory,
     _affected,
+    _arrange,
     _bind,
     _bound_chunks,
     _decode_notification,
     _quote_identifier,
     _quote_literal,
+    _read_description,
     _Result,
+    PIPELINE_SYNC_STATEMENTS,
+    _COPY_CHUNK,
+    _compile,
+    _copy_text_chunks,
+    _CopyLines,
     _set_keepalive,
     _to_native_placeholders,
 )
 from .exceptions import (
     DatabaseError,
     InterfaceError,
+    NotSupportedError,
     OperationalError,
     ProgrammingError,
     TransactionRolledBack,
@@ -208,10 +218,21 @@ class AsyncConnection:
 
     # --- statements ---
 
-    def cursor(self, row_factory: Optional[RowFactory] = None) -> "AsyncCursor":
-        """A new cursor (see :meth:`nusadb.Connection.cursor`)."""
+    def cursor(
+        self,
+        row_factory: Optional[RowFactory] = None,
+        *,
+        name: Optional[str] = None,
+        scrollable: Optional[bool] = None,
+        withhold: bool = False,
+    ) -> "AsyncCursor":
+        """A new cursor; with a ``name``, an :class:`AsyncServerCursor` (see
+        :meth:`nusadb.Connection.cursor`)."""
         self._check_open()
-        return AsyncCursor(self, row_factory if row_factory is not None else self.row_factory)
+        factory = row_factory if row_factory is not None else self.row_factory
+        if name is not None:
+            return AsyncServerCursor(self, name, factory, scrollable, withhold)
+        return AsyncCursor(self, factory)
 
     async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> "AsyncCursor":
         """Run ``sql`` on a new cursor and return it, ready to fetch from."""
@@ -263,6 +284,12 @@ class AsyncConnection:
         """Read a query's rows ``batch_rows`` at a time: ``async with conn.stream(sql) as rows:``
         then ``async for row in rows``. The connection runs nothing else until the stream ends."""
         return AsyncRowStream(self, sql, parameters, max(1, batch_rows), row_factory)
+
+    def pipeline(self) -> "AsyncPipeline":
+        """``async with conn.pipeline() as p:`` queues statements and sends them together when the
+        block ends or ``await p.sync()`` runs (see :meth:`nusadb.Connection.pipeline`)."""
+        self._check_open()
+        return AsyncPipeline(self)
 
     async def commit(self) -> None:
         """Commit the open transaction (see :meth:`nusadb.Connection.commit`)."""
@@ -372,17 +399,23 @@ class AsyncConnection:
             await self._begin_if_needed()
             self._send(proto.query(sql))
             await self._await_copy_start(proto.B_COPY_IN)
-            try:
-                async for chunk in _chunks(source):
-                    if chunk:
-                        self._send(proto.copy_data(chunk))
-                        await self._flush()
-            except (OSError, DatabaseError, InterfaceError):
-                raise
-            except Exception as exc:  # noqa: BLE001 - report any source failure, stay in sync
-                self._send(proto.copy_fail("nusadb: client read error during COPY"))
-                await self._drain_to_ready()
-                raise OperationalError(f"COPY source read failed: {exc}") from exc
+            chunks = _chunks(source).__aiter__()
+            while True:
+                # Only the source's own failures end the COPY with CopyFail; a socket error while
+                # sending propagates as it is.
+                try:
+                    chunk = await chunks.__anext__()
+                except StopAsyncIteration:
+                    break
+                except Exception as exc:  # noqa: BLE001 - report any source failure, stay in sync
+                    self._send(proto.copy_fail("nusadb: client read error during COPY"))
+                    await self._drain_to_ready()
+                    if isinstance(exc, ProgrammingError):
+                        raise  # a row copy_in_rows could not write
+                    raise OperationalError(f"COPY source read failed: {exc}") from exc
+                if chunk:
+                    self._send(proto.copy_data(chunk))
+                    await self._flush()
             self._send(proto.copy_done())
             return await self._finish_copy()
 
@@ -408,6 +441,21 @@ class AsyncConnection:
                     await self._drain_to_ready()
                     raise from_sqlstate(*error)
             return await self._finish_copy()
+
+    async def copy_in_rows(self, sql: str, rows: Union[Iterable[Any], AsyncIterable[Any]]) -> int:
+        """Bulk-load Python rows (an iterable or async iterable of value sequences) through
+        ``COPY ... FROM STDIN`` in the default text format; see
+        :meth:`nusadb.Connection.copy_in_rows`. Returns the number of rows loaded."""
+        if hasattr(rows, "__aiter__"):
+            return await self.copy_in(sql, _async_copy_text_chunks(rows))
+        return await self.copy_in(sql, _copy_text_chunks(rows))
+
+    async def copy_out_rows(self, sql: str) -> List[Tuple[Optional[str], ...]]:
+        """Export through ``COPY ... TO STDOUT`` as a list of rows, each a tuple of field text
+        (``None`` for NULL); see :meth:`nusadb.Connection.copy_out_rows`."""
+        lines = _CopyLines()
+        await self.copy_out(sql, lines)
+        return lines.finish()
 
     # --- cancellation ---
 
@@ -568,16 +616,8 @@ class AsyncConnection:
         error: Optional[Tuple[str, str]] = None
         while True:
             mtype, r = await self._read_message()
-            if mtype == proto.B_ROW_DESCRIPTION:
-                count = r.u16()
-                columns = [r.string() for _ in range(count)]
-                column_types = [None] * count
-            elif mtype == proto.B_ROW_DESCRIPTION_TYPED:
-                count = r.u16()
-                columns, column_types = [], []
-                for _ in range(count):
-                    columns.append(r.string())
-                    column_types.append(proto.type_name(r.u8()))
+            if mtype in (proto.B_ROW_DESCRIPTION, proto.B_ROW_DESCRIPTION_TYPED):
+                columns, column_types = _read_description(mtype, r)
             elif mtype == proto.B_DATA_ROW:
                 rows.append(r.fields())
             elif mtype == proto.B_COMMAND_COMPLETE:
@@ -604,8 +644,9 @@ class AsyncConnection:
         if not parameters:
             self._send(proto.query(sql))
             return await self._read_until_ready()
-        encoded, tags = _bind(parameters)
-        self._send(proto.parse("", _to_native_placeholders(sql), tags))
+        compiled = _compile(sql)
+        encoded, tags = _bind(_arrange(compiled, parameters))
+        self._send(proto.parse("", compiled.sql, tags))
         self._send(proto.bind("", "", encoded))
         self._send(proto.describe_portal(""))
         self._send(proto.execute("", 0))
@@ -625,9 +666,11 @@ class AsyncConnection:
         """Pipelined executions (see :meth:`nusadb.Cursor.executemany`); each chunk is bound whole
         before any of it is sent."""
         await self._begin_if_needed()
-        sql = _to_native_placeholders(sql)
+        compiled = _compile(sql)
+        sql = compiled.sql
         total, counted = 0, False
-        for chunk, failure in _bound_chunks(seq_of_parameters):
+        rows = (_arrange(compiled, parameters) for parameters in seq_of_parameters)
+        for chunk, failure in _bound_chunks(rows):
             if chunk:
                 tags: Optional[bytes] = None
                 for encoded, row_tags in chunk:
@@ -689,6 +732,97 @@ class AsyncConnection:
         return max(_affected(tag), 0)
 
 
+class AsyncPipeline:
+    """Statements queued on the client and sent together (see :class:`nusadb.Pipeline`). Until a
+    sync nothing is sent, so other tasks can keep using the connection; the queued statements run
+    after whatever those tasks sent first."""
+
+    def __init__(self, connection: AsyncConnection) -> None:
+        self._conn = connection
+        self._queued: List[Tuple[bytes, "AsyncCursor"]] = []
+        self._size = 0
+        self._active = False
+
+    async def __aenter__(self) -> "AsyncPipeline":
+        self._conn._check_open()
+        self._active = True
+        return self
+
+    async def __aexit__(self, exc_type: Any, *_exc: object) -> None:
+        try:
+            if exc_type is None:
+                await self.sync()
+        finally:
+            self._queued = []
+            self._size = 0
+            self._active = False
+
+    async def execute(
+        self,
+        sql: str,
+        parameters: Any = (),
+        row_factory: Optional[RowFactory] = None,
+    ) -> "AsyncCursor":
+        """Queue ``sql`` with ``parameters``; the returned cursor holds its result after the next
+        sync. Sends the queue first when it is full."""
+        if not self._active:
+            raise ProgrammingError(
+                "use the pipeline as a context manager: async with conn.pipeline() as p"
+            )
+        conn = self._conn
+        conn._check_open()
+        compiled = _compile(sql)
+        encoded, tags = _bind(_arrange(compiled, parameters))
+        frames = b"".join(
+            (
+                proto.parse("", compiled.sql, tags),
+                proto.bind("", "", encoded),
+                proto.describe_portal(""),
+                proto.execute("", 0),
+            )
+        )
+        cursor = conn.cursor(row_factory)
+        self._queued.append((frames, cursor))
+        self._size += len(frames)
+        if len(self._queued) >= PIPELINE_SYNC_STATEMENTS or self._size >= _COPY_CHUNK:
+            await self.sync()
+        return cursor
+
+    async def sync(self) -> None:
+        """Send the queued statements and load each result into its cursor. Raises the first
+        error; the statements after it in this sync did not run."""
+        if not self._queued:
+            return
+        queued, self._queued, self._size = self._queued, [], 0
+        conn = self._conn
+        async with conn._exchange():
+            await conn._begin_if_needed()
+            conn._send(b"".join(frames for frames, _cursor in queued) + proto.sync())
+            cursors = iter(cursor for _frames, cursor in queued)
+            columns: List[str] = []
+            column_types: List[Optional[str]] = []
+            rows: List[List[Optional[bytes]]] = []
+            error: Optional[Tuple[str, str]] = None
+            while True:
+                mtype, r = await conn._read_message()
+                if mtype in (proto.B_ROW_DESCRIPTION, proto.B_ROW_DESCRIPTION_TYPED):
+                    columns, column_types = _read_description(mtype, r)
+                elif mtype == proto.B_DATA_ROW:
+                    rows.append(r.fields())
+                elif mtype == proto.B_COMMAND_COMPLETE:
+                    next(cursors)._load((columns, column_types, rows, r.string()))
+                    columns, column_types, rows = [], [], []
+                elif mtype == proto.B_ERROR:
+                    error = (r.string(), r.string())
+                elif mtype == proto.B_NOTIFICATION_RESPONSE:
+                    conn._notifications.append(_decode_notification(r))
+                elif mtype == proto.B_READY:
+                    r.u8()
+                    break
+        if error is not None:
+            raise from_sqlstate(*error)
+
+
 class _Exchange:
     """One request and its reply: taken in turn by the tasks sharing a connection, and refused on
     a connection that is closed, broken, streaming, or left part way through an earlier one."""
@@ -719,6 +853,19 @@ class _Exchange:
 
     async def __aexit__(self, *_exc: object) -> None:
         self._conn._lock.release()
+
+
+async def _async_copy_text_chunks(rows: AsyncIterable[Any]) -> AsyncIterator[bytes]:
+    """An async iterable of rows as COPY text-format data, a chunk per thousand rows or 64 KiB."""
+    batch: List[Any] = []
+    async for row in rows:
+        batch.append(row)
+        if len(batch) >= 1000:
+            for chunk in _copy_text_chunks(batch):
+                yield chunk
+            batch = []
+    for chunk in _copy_text_chunks(batch):
+        yield chunk
 
 
 async def _chunks(source: Any) -> AsyncIterator[bytes]:
@@ -788,7 +935,8 @@ class AsyncCursor:
         async with self._conn._exchange():
             if isinstance(operation, AsyncPreparedStatement):
                 result = await self._conn._query_prepared(
-                    self._statement_name(operation), parameters or ()
+                    self._statement_name(operation),
+                    _arrange(operation._compiled, parameters or ()),
                 )
             else:
                 result = await self._conn._query(operation, parameters or ())
@@ -808,7 +956,9 @@ class AsyncCursor:
                 name = self._statement_name(operation)
                 total, counted = 0, False
                 for parameters in seq_of_parameters:
-                    *_unused, tag = await self._conn._query_prepared(name, parameters)
+                    *_unused, tag = await self._conn._query_prepared(
+                        name, _arrange(operation._compiled, parameters)
+                    )
                     affected = _affected(tag)
                     if affected >= 0:
                         total, counted = total + affected, True
@@ -866,6 +1016,162 @@ class AsyncCursor:
         await self.close()
 
 
+class AsyncServerCursor(AsyncCursor):
+    """A named cursor whose query stays on the server, fetched as it is read (see
+    :class:`nusadb.ServerCursor`): ``await cur.execute(sql)``, then the ``fetch*`` coroutines,
+    ``async for`` (:attr:`itersize` rows per round trip) and ``await cur.scroll(n)``."""
+
+    def __init__(
+        self,
+        connection: AsyncConnection,
+        name: str,
+        row_factory: Optional[RowFactory],
+        scrollable: Optional[bool],
+        withhold: bool,
+    ) -> None:
+        super().__init__(connection, row_factory)
+        self.name = name
+        self.scrollable = scrollable
+        self.withhold = withhold
+        self.itersize = 2000
+        self._declared = False
+        self._fetched = 0
+        self.rownumber: Optional[int] = None
+
+    async def execute(  # type: ignore[override]
+        self, operation: str, parameters: Optional[Any] = None
+    ) -> "AsyncServerCursor":
+        """Declare the cursor for ``operation``, closing the one declared before."""
+        self._check()
+        if not isinstance(operation, str):
+            raise NotSupportedError("a named cursor takes SQL text, not a prepared statement")
+        await self._close_on_server()
+        scroll = {None: "", True: "SCROLL ", False: "NO SCROLL "}[self.scrollable]
+        hold = " WITH HOLD" if self.withhold else ""
+        sql = f"DECLARE {_quote_identifier(self.name)} {scroll}CURSOR{hold} FOR {operation}"
+        async with self._conn._exchange():
+            await self._conn._query(sql, parameters or ())
+        self._declared = True
+        self._rows._load([], [], [], None)
+        self._fetched = 0
+        self.rowcount = -1
+        self.rownumber = 0
+        return self
+
+    async def executemany(self, operation: Any, seq_of_parameters: Any) -> None:
+        raise NotSupportedError("executemany is not available on a named cursor")
+
+    async def fetchone(self) -> Any:
+        self._check_declared()
+        if not self._buffered():
+            await self._fetch("FORWARD 1")
+        return self._deliver()
+
+    async def fetchmany(self, size: Optional[int] = None) -> List[Any]:
+        self._check_declared()
+        n = self.arraysize if size is None else size
+        out = self._take(n)
+        if len(out) < n:
+            await self._fetch(f"FORWARD {n - len(out)}")
+            out.extend(self._take(n - len(out)))
+        return out
+
+    async def fetchall(self) -> List[Any]:
+        self._check_declared()
+        out = self._take(self._buffered())
+        await self._fetch("FORWARD ALL")
+        out.extend(self._take(self._buffered()))
+        return out
+
+    async def __anext__(self) -> Any:
+        self._check_declared()
+        if not self._buffered():
+            await self._fetch(f"FORWARD {max(1, self.itersize)}")
+        row = self._deliver()
+        if row is None:
+            raise StopAsyncIteration
+        return row
+
+    async def scroll(self, value: int, mode: str = "relative") -> None:
+        """Move to another row (see :meth:`nusadb.ServerCursor.scroll`)."""
+        self._check_declared()
+        if mode not in ("relative", "absolute"):
+            raise ProgrammingError(f"scroll mode must be 'relative' or 'absolute', not {mode!r}")
+        current = self.rownumber or 0
+        target = current + value if mode == "relative" else value
+        if target < 0:
+            raise IndexError("scroll would move before the first row")
+        if not await self._position(target) and target != 0:
+            await self._position(current)
+            raise IndexError("scroll would move past the last row")
+        self._rows._load([], [], [], None)
+        self.rownumber = target
+
+    async def close(self) -> None:
+        if not self._closed:
+            try:
+                await self._close_on_server()
+            finally:
+                self._closed = True
+
+    def _check_declared(self) -> None:
+        self._check()
+        if not self._declared:
+            raise ProgrammingError("execute a query on the named cursor first")
+
+    def _buffered(self) -> int:
+        return len(self._rows._rows) - self._rows._pos
+
+    async def _fetch(self, how: str) -> None:
+        async with self._conn._exchange():
+            columns, column_types, rows, _tag = await self._conn._query(
+                f"FETCH {how} FROM {_quote_identifier(self.name)}", ()
+            )
+        if not columns:
+            columns, column_types = self._rows._columns, self._rows._column_types
+        self._rows._load(columns, column_types, rows, None)
+        self._fetched += len(rows)
+        self.rowcount = self._fetched
+
+    async def _position(self, row: int) -> bool:
+        async with self._conn._exchange():
+            _columns, _types, rows, _tag = await self._conn._query(
+                f"FETCH ABSOLUTE {row} FROM {_quote_identifier(self.name)}", ()
+            )
+        return bool(rows)
+
+    def _deliver(self) -> Any:
+        row = self._rows._next_row()
+        if row is not None and self.rownumber is not None:
+            self.rownumber += 1
+        return row
+
+    def _take(self, n: int) -> List[Any]:
+        out: List[Any] = []
+        while len(out) < n:
+            row = self._deliver()
+            if row is None:
+                break
+            out.append(row)
+        return out
+
+    async def _close_on_server(self) -> None:
+        if not self._declared:
+            return
+        self._declared = False
+        conn = self._conn
+        if conn._closed or conn._status == "E" or (conn._status == "I" and not self.withhold):
+            return
+        try:
+            async with conn._exchange():
+                # Sent as it is: closing must not open a transaction outside autocommit mode.
+                conn._send(proto.query(f"CLOSE {_quote_identifier(self.name)}"))
+                await conn._read_until_ready()
+        except ProgrammingError as exc:
+            if getattr(exc, "sqlstate", None) != "34000":
+                raise
+
+
 class _Detached:
     """Stands in for the connection of the blocking cursor that only decodes rows here."""
 
@@ -883,6 +1189,8 @@ class AsyncPreparedStatement:
         self.name = name
         self.sql = sql
         self.closed = False
+        # How this statement's parameters map onto its placeholders (by position or by name).
+        self._compiled = _compile(sql)
 
     async def close(self) -> None:
         if self.closed:
@@ -996,8 +1304,9 @@ class AsyncRowStream:
         await conn._exchange().__aenter__()
         try:
             await conn._begin_if_needed()
-            encoded, tags = _bind(self._parameters)
-            conn._send(proto.parse("", _to_native_placeholders(self._sql), tags))
+            compiled = _compile(self._sql)
+            encoded, tags = _bind(_arrange(compiled, self._parameters))
+            conn._send(proto.parse("", compiled.sql, tags))
             conn._send(proto.bind("", "", encoded))
             conn._send(proto.describe_portal(""))
             conn._send(proto.execute("", self._batch))

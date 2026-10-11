@@ -66,6 +66,19 @@ Placeholders are positional: `$1`, `$2`, ... (the server's own marker) or the DB
 which the driver rewrites to `$1` outside strings, comments and `::` casts. `paramstyle` is
 `"numeric"`. Pass the values as a sequence; `None` is SQL `NULL`.
 
+The `pyformat` markers work as well, so code written for that style runs unchanged: `%s` takes
+the values by position, and `%(name)s` takes them by name from a mapping, where a name may appear
+more than once. In such a query write `%%` for a literal `%` (a modulo). A query that uses `$1` or
+`:1` keeps its `%` as written.
+
+```python
+cur.execute("SELECT * FROM orders WHERE customer = %(id)s AND total > %(min)s", {"id": 7, "min": 100})
+cur.executemany("INSERT INTO t VALUES (%s, %s)", [(1, "a"), (2, "b")])
+```
+
+Mixing `%s` and `%(name)s`, a missing name, or the wrong number of values raises
+`ProgrammingError` before anything reaches the server.
+
 Each parameter declares its type to the server, so it binds as exactly that type. A `str` stays
 text even when it looks like a number (`"007"` keeps its zeros), and an `int` stays an integer.
 
@@ -104,7 +117,19 @@ Each column's type, reported by the server, decides the Python type it decodes t
 | `JSON` | the parsed `dict` / `list` / scalar |
 | arrays | `list`, elements decoded at the array's element type |
 | `BYTEA` | `bytes` |
+| ranges (`INT4RANGE`, `DATERANGE`, `TSTZRANGE`, ...) | `nusadb.Range` |
+| `INET` | `ipaddress` interface, or address for a single host |
+| `CIDR` | `ipaddress` network |
+| `VECTOR` | `list` of `float` |
 | `TEXT` and anything else | `str` |
+
+`MACADDR`, `BIT`, geometric types, `TSVECTOR`, `XML` and the rest keep their text, with the type name
+in `cursor.description`. A composite (row) value also arrives as text; `nusadb.parse_record(text)`
+splits it into its fields.
+
+The same types bind as parameters: a `nusadb.Range(lower, upper, bounds="[)")` (`None` for an
+unbounded side, `Range(empty=True)` for the empty range), an `ipaddress` address, interface or
+network, and `nusadb.Vector([...])` for a vector (a plain list binds as an array).
 
 A value that does not parse as its type comes back as its text rather than raising mid-fetch.
 `cursor.description[i][1]` is the column's type name, and it compares equal to the PEP-249 type
@@ -193,7 +218,36 @@ sink = io.BytesIO()
 exported = conn.copy_out("COPY t TO STDOUT", sink)
 ```
 
-A `COPY` the server refuses raises, and the connection stays usable.
+To load Python values without formatting them yourself, `conn.copy_in_rows` takes an iterable of
+rows (a generator streams a load of any size); each value is written as it would bind as a
+parameter. `conn.copy_out_rows` returns the rows of an export as tuples of text, `None` for `NULL`:
+
+```python
+loaded = conn.copy_in_rows("COPY t (id, name) FROM STDIN", [(1, "alice"), (2, None)])
+rows = conn.copy_out_rows("COPY t TO STDOUT")  # [("1", "alice"), ("2", None)]
+```
+
+These two use the default text format, so the statement must not set `FORMAT`, `DELIMITER` or
+`NULL`. A `COPY` the server refuses raises, and the connection stays usable; so does a row the
+driver cannot write, which loads nothing.
+
+## Pipelines
+
+`conn.pipeline()` sends a group of statements in one round trip. Inside the block, `p.execute`
+queues a statement and returns the cursor its result will be loaded into; the results arrive when
+the block ends (or at `p.sync()`):
+
+```python
+with conn.pipeline() as p:
+    inserted = p.execute("INSERT INTO t (id, name) VALUES (%s, %s)", (1, "alice"))
+    found = p.execute("SELECT name FROM t WHERE id = %s", (1,))
+print(inserted.rowcount, found.fetchall())
+```
+
+When a statement fails, the server skips the rest of that group and the error is raised; the
+skipped statements' cursors stay empty. An exception inside the block sends nothing that was still
+queued. A queue is also sent on its own once it holds `nusadb.PIPELINE_SYNC_STATEMENTS` (256)
+statements. `nusadb.aio` has the same API with `async with` and `await p.execute(...)`.
 
 ## Prepared statements
 
@@ -218,6 +272,26 @@ with conn.stream("SELECT id, payload FROM events WHERE day = $1", [day]) as rows
     for row in rows:
         handle(row)
 ```
+
+A named cursor keeps the query on the server and brings rows over as they are fetched:
+`fetchone` and `fetchmany(n)` ask for just those rows, and iteration fetches `cur.itersize` (2000)
+at a time. Unlike a stream, the connection stays free for other statements between fetches.
+
+```python
+conn = nusadb.connect(autocommit=False)
+cur = conn.cursor(name="events", scrollable=True)
+cur.execute("SELECT id, payload FROM events WHERE day = %s ORDER BY id", (day,))
+first = cur.fetchmany(100)
+cur.scroll(-10)                 # back ten rows; scroll(0, "absolute") goes to the start
+for row in cur:
+    handle(row)
+cur.close()
+```
+
+The cursor lives until its transaction ends. In autocommit mode, or to keep it past `commit()`,
+pass `withhold=True`. `scrollable=True` allows moving back; `cur.rownumber` is the index of the next
+row and `description` is set once the first rows are fetched. `nusadb.aio` has the same with
+`await` and `async for`.
 
 ## Row shapes and custom types
 

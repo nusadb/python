@@ -28,7 +28,9 @@ TYPE_TAGS = {
     0x00: "UNKNOWN", 0x01: "BOOL", 0x02: "INT", 0x03: "FLOAT", 0x04: "NUMERIC",
     0x05: "TEXT", 0x06: "BYTES", 0x07: "DATE", 0x08: "TIME", 0x09: "TIMETZ",
     0x0A: "TIMESTAMP", 0x0B: "TIMESTAMPTZ", 0x0C: "INTERVAL", 0x0D: "UUID",
-    0x0E: "JSON", 0x0F: "ARRAY", 0x10: "VECTOR",
+    0x0E: "JSON", 0x0F: "ARRAY", 0x10: "VECTOR", 0x11: "MACADDR", 0x12: "INET",
+    0x13: "CIDR", 0x14: "BIT", 0x15: "VARBIT", 0x16: "RANGE", 0x17: "MACADDR8",
+    0x18: "GEOMETRY", 0x19: "TSVECTOR", 0x1A: "TSQUERY", 0x1B: "XML",
 }
 
 # The tag byte for each type name, for declaring parameter types in ``Parse``.

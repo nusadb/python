@@ -18,19 +18,24 @@ Example::
 ``paramstyle`` is reported as ``"numeric"``, so PEP-249 code uses positional
 ``:1``, ``:2`` markers. The server's own marker is ``$1``; the driver translates
 ``:1`` → ``$1`` for you, and a query written with the native ``$1`` still works.
+The ``pyformat`` markers are accepted too: ``%s`` by position, and ``%(name)s``
+with a mapping of parameters (``%%`` is then a literal ``%``).
 """
 
 from __future__ import annotations
 
 from . import rows
 from .connection import (
+    PIPELINE_SYNC_STATEMENTS,
     STATEMENT_CACHE_SIZE,
     Connection,
     Cursor,
     Json,
     Notification,
+    Pipeline,
     PreparedStatement,
     RowStream,
+    ServerCursor,
     Transaction,
     connect,
     register_adapter,
@@ -64,6 +69,7 @@ from .exceptions import (
     Warning,
 )
 from .pool import Pool
+from .types import Range, Vector, parse_record
 
 # PEP-249 module globals.
 apilevel = "2.0"
@@ -76,8 +82,11 @@ __all__ = [
     "connect",
     "Connection",
     "Cursor",
+    "Pipeline",
+    "PIPELINE_SYNC_STATEMENTS",
     "PreparedStatement",
     "RowStream",
+    "ServerCursor",
     "Transaction",
     "STATEMENT_CACHE_SIZE",
     "register_adapter",
@@ -86,6 +95,9 @@ __all__ = [
     "Json",
     "Notification",
     "Pool",
+    "Range",
+    "Vector",
+    "parse_record",
     "Date",
     "Time",
     "Timestamp",

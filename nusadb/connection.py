@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import ipaddress as _ipaddress
 import itertools
 import json as _json
 import math
@@ -19,8 +20,10 @@ from typing import (
     BinaryIO,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -30,6 +33,7 @@ from typing import (
 
 from . import _protocol as proto
 from . import _scram
+from . import types as _types
 from .exceptions import (
     DatabaseError,
     InterfaceError,
@@ -48,92 +52,257 @@ _Result = Tuple[
 ]
 
 
-def _to_native_placeholders(sql: str) -> str:
-    """Translate DB-API ``numeric`` placeholders (``:1``) to the server-native ``$1`` form.
+def _sql_spans(sql: str) -> List[Tuple[bool, str]]:
+    """Split ``sql`` into ``(is_code, text)`` spans: code, and the parts where a placeholder is never
+    looked for (a single-quoted string, a double-quoted identifier, a dollar-quoted string, a line or
+    block comment). Joining the texts gives ``sql`` back."""
+    spans: List[Tuple[bool, str]] = []
+    start, i, n = 0, 0, len(sql)
 
-    The module declares ``paramstyle = "numeric"``, so portable PEP-249 code writes ``:1``; the Nusa
-    wire protocol's own marker is ``$1``. This rewrites ``:`` followed by digits, but only where it
-    is a real placeholder, never inside a single-quoted string, a double-quoted identifier, a
-    dollar-quoted string, a line/block comment, or a ``::`` type cast. A query that already uses the
-    native ``$1`` form is left untouched (only ``:digits`` is rewritten), so existing code keeps
-    working.
-    """
-    out: List[str] = []
-    i, n = 0, len(sql)
+    def cut(code_end: int, quoted_end: int) -> None:
+        nonlocal start
+        if code_end > start:
+            spans.append((True, sql[start:code_end]))
+        spans.append((False, sql[code_end:quoted_end]))
+        start = quoted_end
+
     while i < n:
         c = sql[i]
         if c == "'" or c == '"':  # quoted string / identifier ('' and "" escape the quote)
-            quote = c
-            out.append(c)
-            i += 1
-            while i < n:
-                out.append(sql[i])
-                if sql[i] == quote:
-                    if i + 1 < n and sql[i + 1] == quote:
-                        out.append(sql[i + 1])
-                        i += 2
+            j = i + 1
+            while j < n:
+                if sql[j] == c:
+                    if j + 1 < n and sql[j + 1] == c:
+                        j += 2
                         continue
-                    i += 1
+                    j += 1
                     break
-                i += 1
+                j += 1
+            cut(i, j)
+            i = j
             continue
-        if c == "-" and i + 1 < n and sql[i + 1] == "-":  # line comment
-            while i < n and sql[i] != "\n":
-                out.append(sql[i])
-                i += 1
+        if c == "-" and sql.startswith("--", i):  # line comment
+            j = sql.find("\n", i)
+            j = n if j == -1 else j
+            cut(i, j)
+            i = j
             continue
-        if c == "/" and i + 1 < n and sql[i + 1] == "*":  # block comment (the server nests)
-            depth = 1
-            out.append("/*")
-            i += 2
-            while i < n and depth > 0:
-                if sql[i] == "/" and i + 1 < n and sql[i + 1] == "*":
-                    depth += 1
-                    out.append("/*")
-                    i += 2
-                elif sql[i] == "*" and i + 1 < n and sql[i + 1] == "/":
-                    depth -= 1
-                    out.append("*/")
-                    i += 2
+        if c == "/" and sql.startswith("/*", i):  # block comment (the server nests)
+            depth, j = 1, i + 2
+            while j < n and depth > 0:
+                if sql.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif sql.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
                 else:
-                    out.append(sql[i])
-                    i += 1
+                    j += 1
+            cut(i, j)
+            i = j
             continue
-        if c == "$":  # dollar-quoted string $tag$...$tag$, or a native $1 marker (left as-is)
+        if c == "$":  # dollar-quoted string $tag$...$tag$ (a native $1 marker stays code)
             j = i + 1
             while j < n and (sql[j].isalnum() or sql[j] == "_"):
                 j += 1
-            if j < n and sql[j] == "$":
+            if j < n and sql[j] == "$" and not sql[i + 1 : j].isdigit():
                 tag = sql[i : j + 1]
-                out.append(tag)
-                i = j + 1
-                end = sql.find(tag, i)
-                if end == -1:
-                    out.append(sql[i:])
-                    i = n
-                else:
-                    out.append(sql[i : end + len(tag)])
-                    i = end + len(tag)
+                end = sql.find(tag, j + 1)
+                close = n if end == -1 else end + len(tag)
+                cut(i, close)
+                i = close
                 continue
-            out.append(c)
-            i += 1
-            continue
-        if c == ":":
-            if i + 1 < n and sql[i + 1] == ":":  # :: type cast, never a placeholder
-                out.append("::")
-                i += 2
-                continue
-            j = i + 1
-            while j < n and sql[j].isdigit():
-                j += 1
-            if j > i + 1:  # :<digits> → $<digits>
-                out.append("$")
-                out.append(sql[i + 1 : j])
-                i = j
-                continue
-        out.append(c)
         i += 1
-    return "".join(out)
+    if start < n:
+        spans.append((True, sql[start:]))
+    return spans
+
+
+# A placeholder in code: a native `$1`, a numeric `:1` (not a `::` cast), a `%%` escape, a `%s`, or a
+# `%(name)s`.
+_PLACEHOLDER = _re.compile(r"::|\$(\d+)|:(\d+)|%%|%s|%\((\w+)\)s")
+
+
+class _Compiled:
+    """SQL with its placeholders rewritten to the native ``$1`` form, and how parameters map onto
+    them: by position, or by name (``names[i]`` is the parameter for ``$i+1``)."""
+
+    __slots__ = ("sql", "names", "count")
+
+    def __init__(self, sql: str, names: Optional[List[str]], count: Optional[int]) -> None:
+        self.sql = sql
+        self.names = names
+        # The number of `%s` markers, checked against the parameters; None for native markers.
+        self.count = count
+
+
+def _compile(sql: str) -> _Compiled:
+    """Rewrite the placeholders of ``sql`` to the server-native ``$1`` form.
+
+    Three spellings are accepted. The native ``$1`` and the DB-API ``numeric`` ``:1`` (rewritten to
+    ``$1``) take parameters by position. When neither appears, the ``pyformat`` markers do: ``%s``
+    by position or ``%(name)s`` by name from a mapping (a name may repeat), with ``%%`` for a literal
+    ``%``. A ``%`` in a query that uses ``$1`` or ``:1`` is left alone, so a modulo there needs no
+    escaping. Placeholders are only recognised in code, never inside a string, an identifier, a
+    dollar-quoted string or a comment.
+    """
+    spans = _sql_spans(sql)
+    native = any(
+        m.group(1) is not None or m.group(2) is not None
+        for is_code, text in spans
+        if is_code
+        for m in _PLACEHOLDER.finditer(text)
+    )
+    names: List[str] = []
+    positional = 0
+    named = False
+
+    def rewrite(m: "_re.Match[str]") -> str:
+        nonlocal positional, named
+        token = m.group(0)
+        if token == "::" or m.group(1) is not None:
+            return token
+        if m.group(2) is not None:
+            return "$" + m.group(2)
+        if native:
+            return token
+        if token == "%%":
+            return "%"
+        if token == "%s":
+            positional += 1
+            return f"${positional}"
+        named = True
+        name = m.group(3)
+        if name not in names:
+            names.append(name)
+        return f"${names.index(name) + 1}"
+
+    out = "".join(_PLACEHOLDER.sub(rewrite, text) if is_code else text for is_code, text in spans)
+    if positional and named:
+        raise ProgrammingError("a query uses either %s or %(name)s placeholders, not both")
+    if named:
+        return _Compiled(out, names, None)
+    return _Compiled(out, None, positional if positional else None)
+
+
+def _to_native_placeholders(sql: str) -> str:
+    """``sql`` with its placeholders in the native ``$1`` form (see :func:`_compile`)."""
+    return _compile(sql).sql
+
+
+def _arrange(compiled: _Compiled, parameters: Any) -> Sequence[Any]:
+    """The parameters of one execution in ``$1``, ``$2``, ... order: taken by name from a mapping
+    for ``%(name)s`` placeholders, or as given."""
+    if compiled.names is not None:
+        if not isinstance(parameters, Mapping):
+            raise ProgrammingError("%(name)s placeholders take a mapping of parameters")
+        try:
+            return [parameters[name] for name in compiled.names]
+        except KeyError as missing:
+            raise ProgrammingError(f"no parameter named {missing.args[0]!r}") from None
+    if isinstance(parameters, Mapping):
+        if not parameters:
+            return ()
+        raise ProgrammingError("a mapping of parameters needs %(name)s placeholders")
+    if compiled.count is not None and len(parameters) != compiled.count:
+        raise ProgrammingError(
+            f"the query has {compiled.count} %s placeholder(s) but {len(parameters)} "
+            "parameter(s) were given"
+        )
+    return parameters
+
+
+# COPY text format (wire-protocol §12): tab between fields, `\N` for NULL, one row per line, and a
+# backslash before a backslash, tab, newline or carriage return inside a field.
+_COPY_ESCAPES = str.maketrans({"\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r"})
+_COPY_UNESCAPES = {"t": "\t", "n": "\n", "r": "\r"}
+_COPY_CHUNK = 65536
+
+
+def _copy_line(row: Sequence[Any]) -> str:
+    """One row as a COPY text-format line: each value written as it binds as a parameter."""
+    if isinstance(row, (str, bytes)) or not isinstance(row, Sequence):
+        raise ProgrammingError(f"a COPY row must be a sequence of values, not {type(row).__name__}")
+    fields = []
+    for value in row:
+        encoded = _encode_param(value)
+        fields.append("\\N" if encoded is None else encoded.decode("utf-8").translate(_COPY_ESCAPES))
+    return "\t".join(fields) + "\n"
+
+
+def _copy_text_chunks(rows: Iterable[Sequence[Any]]) -> Iterator[bytes]:
+    """``rows`` as COPY text-format data, in chunks of about 64 KiB."""
+    pending: List[str] = []
+    size = 0
+    for row in rows:
+        line = _copy_line(row)
+        pending.append(line)
+        size += len(line)
+        if size >= _COPY_CHUNK:
+            yield "".join(pending).encode("utf-8")
+            pending, size = [], 0
+    if pending:
+        yield "".join(pending).encode("utf-8")
+
+
+def _parse_copy_line(line: str) -> Tuple[Optional[str], ...]:
+    """A COPY text-format line as its fields: text with escapes decoded, ``None`` for NULL."""
+    fields: List[Optional[str]] = []
+    current: List[str] = []
+    raw = ""
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and i + 1 < len(line):
+            escaped = line[i + 1]
+            current.append(_COPY_UNESCAPES.get(escaped, escaped))
+            raw += c + escaped
+            i += 2
+            continue
+        if c == "\t":
+            fields.append(None if raw == "\\N" else "".join(current))
+            current, raw = [], ""
+        else:
+            current.append(c)
+            raw += c
+        i += 1
+    fields.append(None if raw == "\\N" else "".join(current))
+    return tuple(fields)
+
+
+class _CopyLines:
+    """Collects the ``CopyData`` chunks of a ``COPY ... TO STDOUT`` and splits them into rows; a
+    row may be cut across two chunks."""
+
+    def __init__(self) -> None:
+        self.rows: List[Tuple[Optional[str], ...]] = []
+        self._tail = b""
+
+    def __call__(self, chunk: bytes) -> None:
+        data = self._tail + chunk
+        *lines, self._tail = data.split(b"\n")
+        self.rows.extend(_parse_copy_line(line.decode("utf-8")) for line in lines)
+
+    def finish(self) -> List[Tuple[Optional[str], ...]]:
+        if self._tail:
+            self.rows.append(_parse_copy_line(self._tail.decode("utf-8")))
+            self._tail = b""
+        return self.rows
+
+
+class _SinkWriter:
+    """A ``write(bytes)`` file-like that hands each chunk to ``sink``."""
+
+    def __init__(self, sink: Callable[[bytes], None]) -> None:
+        self.write = sink
+
+
+class _ChunkReader:
+    """A ``read(size)`` file-like over an iterator of byte chunks, for :meth:`Connection.copy_in`."""
+
+    def __init__(self, chunks: Iterator[bytes]) -> None:
+        self._chunks = chunks
+
+    def read(self, _size: int = -1) -> bytes:
+        return next(self._chunks, b"")
 
 
 class Json:
@@ -211,6 +380,14 @@ def _bind(params: Any) -> Tuple[List[Optional[bytes]], bytes]:
     return [_encode_param(v) for v in values], bytes(_param_tag(v) for v in values)
 
 
+_IP_ADDRESS_TYPES = (
+    _ipaddress.IPv4Address,
+    _ipaddress.IPv6Address,
+    _ipaddress.IPv4Interface,
+    _ipaddress.IPv6Interface,
+)
+
+
 def _param_tag(value: Any) -> int:
     """The type a parameter declares in ``Parse`` (wire-protocol §9.2), so the server binds it as
     exactly that type: a ``str`` stays text even when it looks like a number. ``0`` (infer) for
@@ -245,6 +422,14 @@ def _param_tag(value: Any) -> int:
         return tag["JSON"]
     if isinstance(value, (list, tuple)):
         return tag["ARRAY"]
+    if isinstance(value, (_ipaddress.IPv4Network, _ipaddress.IPv6Network)):
+        return tag["CIDR"]
+    if isinstance(value, _IP_ADDRESS_TYPES):
+        return tag["INET"]
+    if isinstance(value, _types.Vector):
+        return tag["VECTOR"]
+    # A Range binds as its text, which the server types from where it is used (a range's tag does
+    # not carry its subtype).
     return 0
 
 
@@ -491,8 +676,8 @@ def _decode_array_elements(items: list, decoder) -> list:
 
 
 # Maps a RowDescriptionTyped type name (protocol 1.1) to the function that turns the wire text into a
-# typed Python value, for full typed DB-API fidelity. Tags not listed (TEXT, VECTOR, UNKNOWN) stay
-# as ``str``; BYTES is handled separately in ``_decode_cell``.
+# typed Python value, for full typed DB-API fidelity. Tags not listed (TEXT, MACADDR, BIT, GEOMETRY,
+# TSVECTOR, XML, UNKNOWN, ...) stay as ``str``; BYTES is handled separately in ``_decode_cell``.
 _TYPED_DECODERS = {
     "BOOL": _decode_bool,
     "INT": int,
@@ -507,6 +692,10 @@ _TYPED_DECODERS = {
     "UUID": _uuid.UUID,
     "JSON": _json.loads,
     "ARRAY": _parse_array,
+    "RANGE": _types.decode_range,
+    "INET": _types.decode_inet,
+    "CIDR": _types.decode_cidr,
+    "VECTOR": _types.decode_vector,
 }
 
 
@@ -586,6 +775,7 @@ class Connection:
         self._statements: "OrderedDict[str, PreparedStatement]" = OrderedDict()
         # The open row stream (weakly held: one dropped unread is ended at the next call).
         self._stream: Optional["weakref.ReferenceType[RowStream]"] = None
+        self._pipeline: Optional["Pipeline"] = None
 
         try:
             raw = socket.create_connection(
@@ -620,11 +810,25 @@ class Connection:
 
     # --- PEP-249 connection API ---
 
-    def cursor(self, row_factory: Optional["RowFactory"] = None) -> "Cursor":
+    def cursor(
+        self,
+        row_factory: Optional["RowFactory"] = None,
+        *,
+        name: Optional[str] = None,
+        scrollable: Optional[bool] = None,
+        withhold: bool = False,
+    ) -> "Cursor":
         """A new cursor. ``row_factory`` (default: the connection's ``row_factory``) shapes the
-        rows it fetches; see :mod:`nusadb.rows`."""
+        rows it fetches; see :mod:`nusadb.rows`.
+
+        With a ``name``, the cursor is a :class:`ServerCursor`: its query stays on the server and
+        rows come over as they are fetched. ``scrollable`` declares it ``SCROLL`` (``True``) or
+        ``NO SCROLL`` (``False``); ``withhold`` keeps it open after its transaction commits."""
         self._ensure_open()
-        return Cursor(self, row_factory if row_factory is not None else self.row_factory)
+        factory = row_factory if row_factory is not None else self.row_factory
+        if name is not None:
+            return ServerCursor(self, name, factory, scrollable, withhold)
+        return Cursor(self, factory)
 
     def prepare(self, sql: str) -> "PreparedStatement":
         """Parse ``sql`` once on the server; run it with :meth:`Cursor.execute` or
@@ -674,6 +878,14 @@ class Connection:
         to the end or closed (use it as a context manager)."""
         self._ensure_open()
         return RowStream(self, sql, parameters, max(1, batch_rows), row_factory)
+
+    def pipeline(self) -> "Pipeline":
+        """A block whose statements are sent together: ``p.execute(sql, params)`` queues a
+        statement and returns the cursor its result will be loaded into, and the results arrive
+        when the block ends or :meth:`Pipeline.sync` is called. A whole block costs one round trip
+        (one per :data:`PIPELINE_SYNC_STATEMENTS` statements). See :class:`Pipeline`."""
+        self._ensure_open()
+        return Pipeline(self)
 
     @property
     def autocommit(self) -> bool:
@@ -934,6 +1146,11 @@ class Connection:
             pass
 
     def _send(self, frame: bytes) -> None:
+        if self._pipeline is not None and self._pipeline._queued:
+            # Sent now, this would run before the queued statements and read their replies.
+            raise InterfaceError(
+                "statements are queued in a pipeline on this connection; sync it or end the block"
+            )
         self._pending = True
         try:
             self._sock.sendall(frame)
@@ -1031,18 +1248,8 @@ class Connection:
         error: Optional[Tuple[str, str]] = None
         while True:
             mtype, r = self._read_message()
-            if mtype == proto.B_ROW_DESCRIPTION:
-                count = r.u16()
-                columns = [r.string() for _ in range(count)]
-                column_types = [None] * count
-            elif mtype == proto.B_ROW_DESCRIPTION_TYPED:
-                # Protocol 1.1: each column is a name plus a 1-byte type tag (§9.2).
-                count = r.u16()
-                columns = []
-                column_types = []
-                for _ in range(count):
-                    columns.append(r.string())
-                    column_types.append(proto.type_name(r.u8()))
+            if mtype in (proto.B_ROW_DESCRIPTION, proto.B_ROW_DESCRIPTION_TYPED):
+                columns, column_types = _read_description(mtype, r)
             elif mtype == proto.B_DATA_ROW:
                 rows.append(r.fields())
             elif mtype == proto.B_COMMAND_COMPLETE:
@@ -1067,9 +1274,9 @@ class Connection:
 
     def _extended_query(self, sql: str, params: Sequence[Any]) -> _Result:
         self._begin_if_needed()
-        sql = _to_native_placeholders(sql)
-        encoded, tags = _bind(params)
-        self._send(proto.parse("", sql, tags))
+        compiled = _compile(sql)
+        encoded, tags = _bind(_arrange(compiled, params))
+        self._send(proto.parse("", compiled.sql, tags))
         self._send(proto.bind("", "", encoded))
         self._send(proto.describe_portal(""))
         self._send(proto.execute("", 0))
@@ -1107,6 +1314,8 @@ class Connection:
                     self._drain_to_ready()
                 except (OSError, DatabaseError, InterfaceError):
                     pass  # the connection is broken now; the source's error is the one to report
+                if isinstance(exc, ProgrammingError):
+                    raise  # a row copy_in_rows could not write
                 raise OperationalError(f"COPY source read failed: {exc}") from exc
             if not chunk:
                 break
@@ -1136,6 +1345,26 @@ class Connection:
                 self._drain_to_ready()
                 raise from_sqlstate(*error)
         return self._finish_copy()
+
+    def copy_in_rows(self, sql: str, rows: Iterable[Sequence[Any]]) -> int:
+        """Bulk-load Python rows via ``COPY ... FROM STDIN`` in the default text format.
+
+        Each row is a sequence of values, written as they would bind as parameters (``None`` is
+        NULL, a ``list`` an array, a ``dict`` JSON, ``bytes`` binary). ``rows`` is read lazily, so
+        a generator streams a load of any size. Returns the number of rows loaded. A row that
+        cannot be written (a value of an unsupported type, say) ends the COPY with nothing loaded
+        and raises; the connection stays usable. The statement must not set ``FORMAT``,
+        ``DELIMITER`` or ``NULL``.
+        """
+        return self.copy_in(sql, _ChunkReader(_copy_text_chunks(rows)))
+
+    def copy_out_rows(self, sql: str) -> List[Tuple[Optional[str], ...]]:
+        """Export via ``COPY ... TO STDOUT`` in the default text format, as a list of rows: a tuple
+        per row of each field's text, ``None`` for NULL. The statement must not set ``FORMAT``,
+        ``DELIMITER`` or ``NULL``. For an export too large to hold, use :meth:`copy_out`."""
+        lines = _CopyLines()
+        self.copy_out(sql, _SinkWriter(lines))
+        return lines.finish()
 
     def _await_copy_start(self, expected: int) -> None:
         """Read until the expected ``CopyInResponse``/``CopyOutResponse``; a refused COPY arrives as
@@ -1206,9 +1435,11 @@ class Connection:
         statement reported a count. Stops at the first error and raises it; the statements before
         it keep their effect (each commits on its own in autocommit mode)."""
         self._begin_if_needed()
-        sql = _to_native_placeholders(sql)
+        compiled = _compile(sql)
+        sql = compiled.sql
         total, counted = 0, False
-        for chunk, failure in _bound_chunks(seq_of_parameters):
+        rows = (_arrange(compiled, parameters) for parameters in seq_of_parameters)
+        for chunk, failure in _bound_chunks(rows):
             if chunk:
                 got, any_count = self._send_batch(sql, chunk)
                 total, counted = total + got, counted or any_count
@@ -1249,6 +1480,20 @@ class Connection:
         return total, counted
 
 
+def _read_description(mtype: int, r: Any) -> Tuple[List[str], List[Optional[str]]]:
+    """The column names and type names of a ``RowDescription`` (no types) or, protocol 1.1, a
+    ``RowDescriptionTyped`` (each column a name plus a 1-byte type tag, §9.2)."""
+    count = r.u16()
+    if mtype == proto.B_ROW_DESCRIPTION:
+        return [r.string() for _ in range(count)], [None] * count
+    columns: List[str] = []
+    column_types: List[Optional[str]] = []
+    for _ in range(count):
+        columns.append(r.string())
+        column_types.append(proto.type_name(r.u8()))
+    return columns, column_types
+
+
 def _affected(tag: Optional[str]) -> int:
     """Parse the trailing count of a command tag (``INSERT 3`` -> 3), else -1."""
     if not tag:
@@ -1258,6 +1503,115 @@ def _affected(tag: Optional[str]) -> int:
         return int(last)
     except ValueError:
         return -1
+
+
+#: A pipeline sends its queued statements once this many are waiting (or 64 KiB of them), so the
+#: replies never pile up unread while more is being sent.
+PIPELINE_SYNC_STATEMENTS = 256
+
+
+class Pipeline:
+    """Statements sent together, their replies read together (see :meth:`Connection.pipeline`).
+
+    ``execute`` only queues: nothing reaches the server until :meth:`sync` or the end of the
+    ``with`` block, and each queued statement's cursor holds its result after that. When a
+    statement fails, the server skips the rest of that sync's statements; ``sync`` raises the
+    error and the cursors of the skipped statements stay empty (``rowcount`` -1). In autocommit
+    mode each statement that ran before the failure has committed; inside a transaction, the
+    transaction is failed as with any other error. A full queue is sent by ``execute`` itself,
+    which then raises any error from it. An exception raised inside the block drops the statements
+    not yet sent. The connection sends nothing else while statements are queued.
+    """
+
+    def __init__(self, connection: Connection) -> None:
+        self._conn = connection
+        self._queued: List[Tuple[bytes, Cursor]] = []
+        self._size = 0
+        self._active = False
+
+    def __enter__(self) -> "Pipeline":
+        conn = self._conn
+        conn._ensure_open()
+        if conn._pipeline is not None:
+            raise ProgrammingError("a pipeline is already open on this connection")
+        conn._pipeline = self
+        self._active = True
+        return self
+
+    def __exit__(self, exc_type: Any, *_exc: object) -> None:
+        try:
+            if exc_type is None:
+                self.sync()
+        finally:
+            self._queued = []
+            self._size = 0
+            self._active = False
+            if self._conn._pipeline is self:
+                self._conn._pipeline = None
+
+    def execute(
+        self,
+        sql: str,
+        parameters: Any = (),
+        row_factory: Optional["RowFactory"] = None,
+    ) -> "Cursor":
+        """Queue ``sql`` with ``parameters`` (any placeholder style the connection takes) and
+        return the cursor its result will be loaded into at the next sync."""
+        if not self._active:
+            raise ProgrammingError("use the pipeline as a context manager: with conn.pipeline() as p")
+        conn = self._conn
+        if conn._broken or conn._closed:
+            conn._ensure_open()
+        compiled = _compile(sql)
+        encoded, tags = _bind(_arrange(compiled, parameters))
+        frames = b"".join(
+            (
+                proto.parse("", compiled.sql, tags),
+                proto.bind("", "", encoded),
+                proto.describe_portal(""),
+                proto.execute("", 0),
+            )
+        )
+        cursor = Cursor(conn, row_factory if row_factory is not None else conn.row_factory)
+        self._queued.append((frames, cursor))
+        self._size += len(frames)
+        if len(self._queued) >= PIPELINE_SYNC_STATEMENTS or self._size >= _COPY_CHUNK:
+            self.sync()
+        return cursor
+
+    def sync(self) -> None:
+        """Send the queued statements and load each result into its cursor. Raises the first
+        error; the statements after it in this sync did not run."""
+        if not self._queued:
+            return
+        queued, self._queued, self._size = self._queued, [], 0
+        conn = self._conn
+        conn._ensure_open()
+        conn._begin_if_needed()
+        conn._send(b"".join(frames for frames, _cursor in queued) + proto.sync())
+        cursors = iter(cursor for _frames, cursor in queued)
+        columns: List[str] = []
+        column_types: List[Optional[str]] = []
+        rows: List[List[Optional[bytes]]] = []
+        error: Optional[Tuple[str, str]] = None
+        while True:
+            mtype, r = conn._read_message()
+            if mtype in (proto.B_ROW_DESCRIPTION, proto.B_ROW_DESCRIPTION_TYPED):
+                columns, column_types = _read_description(mtype, r)
+            elif mtype == proto.B_DATA_ROW:
+                rows.append(r.fields())
+            elif mtype == proto.B_COMMAND_COMPLETE:
+                next(cursors)._load(columns, column_types, rows, r.string())
+                columns, column_types, rows = [], [], []
+            elif mtype == proto.B_ERROR:
+                error = (r.string(), r.string())
+            elif mtype == proto.B_NOTIFICATION_RESPONSE:
+                conn._notifications.append(_decode_notification(r))
+            elif mtype == proto.B_READY:
+                r.u8()
+                break
+        if error is not None:
+            raise from_sqlstate(*error)
 
 
 class Cursor:
@@ -1313,7 +1667,8 @@ class Cursor:
         self._check()
         if isinstance(operation, PreparedStatement):
             result = self._conn._query_prepared(
-                self._statement_name(operation), parameters or ()
+                self._statement_name(operation),
+                _arrange(operation._compiled, parameters or ()),
             )
             self._load(*result)
             return self
@@ -1338,7 +1693,7 @@ class Cursor:
             total, counted = 0, False
             for parameters in seq_of_parameters:
                 *_unused, tag = self._conn._query_prepared(
-                    self._statement_name(operation), parameters
+                    self._statement_name(operation), _arrange(operation._compiled, parameters)
                 )
                 affected = _affected(tag)
                 if affected >= 0:
@@ -1524,6 +1879,180 @@ _DEFAULTS = {
 _POSITIONAL = ("host", "port", "user", "database", "password", "ssl", "timeout", "autocommit")
 
 
+class ServerCursor(Cursor):
+    """A named cursor whose query stays on the server (``DECLARE``), from
+    ``conn.cursor(name=...)``. Rows come over as they are fetched: ``fetchone`` and ``fetchmany``
+    ask for just those rows, iteration :attr:`itersize` rows at a time, so a result of any size is
+    never held whole on the client. ``scroll`` moves within the result.
+
+    A cursor declared without ``withhold`` lives until its transaction ends, so outside autocommit
+    mode the driver's own transaction holds it; in autocommit mode only a ``withhold`` cursor can be
+    declared. ``description`` is known once the first rows have been fetched. ``rowcount`` is the
+    number of rows fetched so far and ``rownumber`` the index of the next row.
+    """
+
+    def __init__(
+        self,
+        connection: Connection,
+        name: str,
+        row_factory: Optional["RowFactory"],
+        scrollable: Optional[bool],
+        withhold: bool,
+    ) -> None:
+        super().__init__(connection, row_factory)
+        self.name = name
+        self.scrollable = scrollable
+        self.withhold = withhold
+        #: Rows fetched per round trip while iterating.
+        self.itersize = 2000
+        self._declared = False
+        self._fetched = 0
+        self.rownumber: Optional[int] = None
+
+    def execute(  # type: ignore[override]
+        self, operation: str, parameters: Optional[Any] = None
+    ) -> "ServerCursor":
+        """Declare the cursor for ``operation`` (a query), closing the one declared before."""
+        self._check()
+        if not isinstance(operation, str):
+            raise NotSupportedError("a named cursor takes SQL text, not a prepared statement")
+        self._close_on_server()
+        scroll = {None: "", True: "SCROLL ", False: "NO SCROLL "}[self.scrollable]
+        hold = " WITH HOLD" if self.withhold else ""
+        sql = f"DECLARE {_quote_identifier(self.name)} {scroll}CURSOR{hold} FOR {operation}"
+        if parameters:
+            self._conn._extended_query(sql, parameters)
+        else:
+            self._conn._simple_query(sql)
+        self._declared = True
+        self._rows, self._pos, self._columns, self._column_types = [], 0, [], []
+        self._fetched = 0
+        self.rowcount = -1
+        self.rownumber = 0
+        return self
+
+    def executemany(self, operation: Any, seq_of_parameters: Any) -> None:
+        raise NotSupportedError("executemany is not available on a named cursor")
+
+    def callproc(self, procname: str, parameters: Optional[Sequence[Any]] = None) -> Sequence[Any]:
+        raise NotSupportedError("callproc is not available on a named cursor")
+
+    def fetchone(self) -> Optional[Tuple[Any, ...]]:
+        self._check_declared()
+        if self._pos >= len(self._rows):
+            self._fetch("FORWARD 1")
+        return self._deliver()
+
+    def fetchmany(self, size: Optional[int] = None) -> List[Tuple[Any, ...]]:
+        self._check_declared()
+        n = self.arraysize if size is None else size
+        out = self._take(n)
+        if len(out) < n:
+            self._fetch(f"FORWARD {n - len(out)}")
+            out.extend(self._take(n - len(out)))
+        return out
+
+    def fetchall(self) -> List[Tuple[Any, ...]]:
+        self._check_declared()
+        out = self._take(len(self._rows) - self._pos)
+        self._fetch("FORWARD ALL")
+        out.extend(self._take(len(self._rows)))
+        return out
+
+    def __next__(self) -> Tuple[Any, ...]:
+        self._check_declared()
+        if self._pos >= len(self._rows):
+            self._fetch(f"FORWARD {max(1, self.itersize)}")
+        row = self._deliver()
+        if row is None:
+            raise StopIteration
+        return row
+
+    def scroll(self, value: int, mode: str = "relative") -> None:
+        """Move to another row: by ``value`` rows from the current one (``mode="relative"``) or to
+        index ``value`` (``"absolute"``, 0 for the first row). The next fetch starts there. Moving
+        outside the result raises ``IndexError`` and leaves the position where it was. Moving back
+        needs a cursor declared ``scrollable=True``."""
+        self._check_declared()
+        if mode not in ("relative", "absolute"):
+            raise ProgrammingError(f"scroll mode must be 'relative' or 'absolute', not {mode!r}")
+        current = self.rownumber or 0
+        target = current + value if mode == "relative" else value
+        if target < 0:
+            raise IndexError("scroll would move before the first row")
+        # Positioned on row `target` (counting from 1), the next fetch returns index `target`.
+        if not self._position(target) and target != 0:
+            self._position(current)
+            raise IndexError("scroll would move past the last row")
+        self._rows, self._pos = [], 0
+        self.rownumber = target
+
+    def close(self) -> None:
+        if not self._closed:
+            try:
+                self._close_on_server()
+            finally:
+                super().close()
+
+    # --- internals ---
+
+    def _check_declared(self) -> None:
+        self._check()
+        if not self._declared:
+            raise ProgrammingError("execute a query on the named cursor first")
+
+    def _fetch(self, how: str) -> None:
+        columns, column_types, rows, _tag = self._conn._simple_query(
+            f"FETCH {how} FROM {_quote_identifier(self.name)}"
+        )
+        if columns:
+            self._columns, self._column_types = columns, column_types
+            self._make_row = None
+        self._rows, self._pos = rows, 0
+        self._fetched += len(rows)
+        self.rowcount = self._fetched
+
+    def _position(self, row: int) -> bool:
+        """Put the server cursor on ``row`` (1-based; 0 is before the first). Whether a row is
+        there."""
+        _columns, _types, rows, _tag = self._conn._simple_query(
+            f"FETCH ABSOLUTE {row} FROM {_quote_identifier(self.name)}"
+        )
+        return bool(rows)
+
+    def _deliver(self) -> Optional[Tuple[Any, ...]]:
+        row = self._next_row()
+        if row is not None and self.rownumber is not None:
+            self.rownumber += 1
+        return row
+
+    def _take(self, n: int) -> List[Tuple[Any, ...]]:
+        out: List[Tuple[Any, ...]] = []
+        while len(out) < n:
+            row = self._deliver()
+            if row is None:
+                break
+            out.append(row)
+        return out
+
+    def _close_on_server(self) -> None:
+        """``CLOSE`` the declared cursor, unless its transaction already ended (which closed it)
+        or failed (which refuses every statement until rolled back)."""
+        if not self._declared:
+            return
+        self._declared = False
+        conn = self._conn
+        if conn._closed or conn._status == "E" or (conn._status == "I" and not self.withhold):
+            return
+        try:
+            # Sent as it is: closing must not open a transaction outside autocommit mode.
+            conn._send(proto.query(f"CLOSE {_quote_identifier(self.name)}"))
+            conn._read_until_ready()
+        except ProgrammingError as exc:
+            if getattr(exc, "sqlstate", None) != "34000":
+                raise
+
+
 def connect(dsn: Optional[str] = None, *args: Any, **kwargs: Any) -> Connection:
     """Open a connection (the PEP-249 module-level constructor).
 
@@ -1617,6 +2146,8 @@ class PreparedStatement:
         self.name = name
         self.sql = sql
         self.closed = False
+        # How this statement's parameters map onto its placeholders (by position or by name).
+        self._compiled = _compile(sql)
 
     def close(self) -> None:
         """Free the statement on the server. Closing it twice is harmless."""
@@ -1721,8 +2252,9 @@ class RowStream:
         self._done = False
         self.rowcount = -1
         connection._begin_if_needed()
-        encoded, tags = _bind(parameters)
-        connection._send(proto.parse("", _to_native_placeholders(sql), tags))
+        compiled = _compile(sql)
+        encoded, tags = _bind(_arrange(compiled, parameters))
+        connection._send(proto.parse("", compiled.sql, tags))
         connection._send(proto.bind("", "", encoded))
         connection._send(proto.describe_portal(""))
         connection._send(proto.execute("", batch_rows))
