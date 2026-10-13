@@ -16,6 +16,10 @@ Query keys:
                                                        of the system roots
 ``tls_cert``, ``tls_key``                              the PEM client certificate and key, for a
                                                        server that requires one
+``binary``                                             ``true`` or ``false``: ask for results in the
+                                                       binary format
+``prepare_threshold``                                  how many runs before a statement is prepared
+                                                       on the server (``none`` never)
 =====================================================  ===============================================
 """
 
@@ -90,6 +94,17 @@ def _apply_query(query: str, tls_default: Optional[str]) -> Dict[str, Any]:
             cert = value
         elif name == "tls_key":
             key = value
+        elif name == "binary":
+            out[name] = _parse_bool(name, value)
+        elif name == "prepare_threshold":
+            if value.lower() in ("none", ""):
+                out[name] = None
+            elif value.isdigit():
+                out[name] = int(value)
+            else:
+                raise ProgrammingError(
+                    f"prepare_threshold must be a whole number or none, not {value!r}"
+                )
         else:
             raise ProgrammingError(f"unknown connection URL parameter {name!r}")
     if (cert is None) != (key is None):
@@ -117,6 +132,15 @@ def _apply_query(query: str, tls_default: Optional[str]) -> Dict[str, Any]:
         raise ProgrammingError(f"could not load the TLS files named in the URL: {exc}") from exc
     out["ssl"] = context
     return out
+
+
+def _parse_bool(name: str, value: str) -> bool:
+    lowered = value.lower()
+    if lowered in ("true", "1", "yes", "on"):
+        return True
+    if lowered in ("false", "0", "no", "off"):
+        return False
+    raise ProgrammingError(f"{name} must be true or false, not {value!r}")
 
 
 def parse_duration(name: str, value: str) -> float:

@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import datetime as _dt
 import ipaddress as _ipaddress
 import itertools
 import json as _json
 import math
 import re as _re
+import base64
 import select
 import socket
 import ssl as ssl_module
+import struct
+import time
 import uuid as _uuid
+import warnings
 from decimal import Decimal, InvalidOperation
 import weakref
 from collections import OrderedDict
@@ -31,6 +37,7 @@ from typing import (
     Union,
 )
 
+from . import _binary
 from . import _protocol as proto
 from . import _scram
 from . import types as _types
@@ -183,6 +190,34 @@ def _compile(sql: str) -> _Compiled:
     return _Compiled(out, None, positional if positional else None)
 
 
+def _sql_text(operation: Any, context: Any = None) -> str:
+    """The SQL text of ``operation``: a ``str`` as it is, or a composed statement from
+    :mod:`nusadb.sql` rendered for ``context`` (the connection)."""
+    if isinstance(operation, str):
+        return operation
+    as_string = getattr(operation, "as_string", None)
+    if callable(as_string):
+        return as_string(context)
+    raise ProgrammingError(
+        f"a statement is SQL text or a nusadb.sql object, not {type(operation).__name__}"
+    )
+
+
+# Statements the server runs only as a simple query (not through Parse and Bind): cursor commands
+# and COPY.
+_SIMPLE_ONLY = frozenset({"DECLARE", "FETCH", "MOVE", "CLOSE", "COPY"})
+
+
+def _needs_simple_query(sql: str) -> bool:
+    """Whether ``sql`` must go as a simple query even when a binary result is asked for: a cursor
+    command, a ``COPY``, or more than one statement."""
+    code = "".join(text if is_code else " " for is_code, text in _sql_spans(sql))
+    if sum(1 for part in code.split(";") if part.strip()) > 1:
+        return True
+    words = code.split(None, 1)
+    return bool(words) and words[0].upper() in _SIMPLE_ONLY
+
+
 def _to_native_placeholders(sql: str) -> str:
     """``sql`` with its placeholders in the native ``$1`` form (see :func:`_compile`)."""
     return _compile(sql).sql
@@ -223,7 +258,7 @@ def _copy_line(row: Sequence[Any]) -> str:
         raise ProgrammingError(f"a COPY row must be a sequence of values, not {type(row).__name__}")
     fields = []
     for value in row:
-        encoded = _encode_param(value)
+        encoded = _encode_param(_adapt(value))
         fields.append("\\N" if encoded is None else encoded.decode("utf-8").translate(_COPY_ESCAPES))
     return "\t".join(fields) + "\n"
 
@@ -327,6 +362,25 @@ _I64_MIN, _I64_MAX = -(2**63), 2**63 - 1
 _ADAPTERS: Dict[type, Callable[[Any], Any]] = {}
 _CUSTOM_DECODERS: Dict[str, Callable[[str], Any]] = {}
 
+# The adapters of the connection whose parameters are being bound (see `_scoped_adapters`), which
+# take precedence over the global ones.
+_SCOPED_ADAPTERS: "contextvars.ContextVar[Optional[Dict[type, Callable[[Any], Any]]]]" = (
+    contextvars.ContextVar("nusadb_adapters", default=None)
+)
+
+
+@contextlib.contextmanager
+def _scoped_adapters(adapters: Dict[type, Callable[[Any], Any]]) -> Iterator[None]:
+    """Apply a connection's own adapters to the values bound inside the block."""
+    if not adapters:
+        yield
+        return
+    token = _SCOPED_ADAPTERS.set(adapters)
+    try:
+        yield
+    finally:
+        _SCOPED_ADAPTERS.reset(token)
+
 
 def register_adapter(cls: type, adapt: Callable[[Any], Any]) -> None:
     """Bind values of ``cls`` (and its subclasses) as ``adapt(value)``, which must return a value
@@ -343,16 +397,20 @@ def register_decoder(type_name: str, decode: Callable[[str], Any]) -> None:
 
 
 def _adapt(value: Any) -> Any:
-    if _ADAPTERS and value is not None:
-        for klass in type(value).__mro__:
-            adapt = _ADAPTERS.get(klass)
-            if adapt is not None:
-                return adapt(value)
+    if value is None:
+        return value
+    for adapters in (_SCOPED_ADAPTERS.get(), _ADAPTERS):
+        if adapters:
+            for klass in type(value).__mro__:
+                adapt = adapters.get(klass)
+                if adapt is not None:
+                    return adapt(value)
     return value
 
 
 def _bound_chunks(
     seq_of_parameters: Any,
+    adapters: Optional[Dict[type, Callable[[Any], Any]]] = None,
 ) -> Iterator[Tuple[List[Tuple[List[Optional[bytes]], bytes]], Optional[Exception]]]:
     """The parameter sets of an ``executemany``, bound in chunks of :data:`_BATCH_ROWS`. A chunk is
     bound whole before any of it is sent, so a value that cannot be bound (or an iterable that
@@ -363,10 +421,11 @@ def _bound_chunks(
         chunk: List[Tuple[List[Optional[bytes]], bytes]] = []
         failure: Optional[Exception] = None
         try:
-            for params in rows:
-                chunk.append(_bind(params))
-                if len(chunk) == _BATCH_ROWS:
-                    break
+            with _scoped_adapters(adapters or {}):
+                for params in rows:
+                    chunk.append(_bind(params))
+                    if len(chunk) == _BATCH_ROWS:
+                        break
         except Exception as exc:  # noqa: BLE001 - reported after the rows before it have run
             failure = exc
         yield chunk, failure
@@ -699,6 +758,162 @@ _TYPED_DECODERS = {
 }
 
 
+class Notice(NamedTuple):
+    """A message the server sends along with a reply instead of failing it: a warning, or a note
+    about what a statement did (protocol 1.3)."""
+
+    severity: str
+    """How serious it is: ``WARNING``, ``NOTICE``, ``INFO``, ``DEBUG``, ``LOG``."""
+    sqlstate: str
+    """The five-character SQLSTATE code (``01000`` for a plain warning)."""
+    message: str
+    """The text of the message."""
+
+
+#: How many notices :attr:`Connection.notices` keeps; older ones are dropped first.
+MAX_NOTICES = 100
+
+
+def _decode_notice(r: "proto.Reader") -> Notice:
+    """Decode a ``NoticeResponse`` body: ``[severity:str][code:str][message:str]``."""
+    return Notice(severity=r.string(), sqlstate=r.string(), message=r.string())
+
+
+def _deliver_notice(conn: Any, r: "proto.Reader") -> None:
+    """Keep a notice on ``conn`` and pass it to the connection's handlers. A handler that raises is
+    reported as a warning: the reply around the notice still has to be read."""
+    notice = _decode_notice(r)
+    conn.notices.append(notice)
+    if len(conn.notices) > MAX_NOTICES:
+        del conn.notices[: len(conn.notices) - MAX_NOTICES]
+    for handler in list(conn._notice_handlers):
+        try:
+            handler(notice)
+        except Exception as exc:  # noqa: BLE001 - a handler must not break the exchange
+            warnings.warn(
+                f"notice handler {handler!r} raised {exc!r}", RuntimeWarning, stacklevel=2
+            )
+
+
+class Xid:
+    """A two-phase commit transaction id (PEP-249 ``xid``): ``format_id``, ``gtrid`` (global
+    transaction id) and ``bqual`` (branch qualifier). It behaves as the 3-tuple
+    ``(format_id, gtrid, bqual)``.
+
+    On the server it is the transaction's gid text: ``<format_id>_<gtrid>_<bqual>``, with gtrid
+    and bqual base64-encoded (UTF-8), which :meth:`from_string` reads back. A gid in any other
+    form is kept as it is: ``format_id`` and ``bqual`` are ``None`` and ``gtrid`` is the whole gid.
+    An xid returned by :meth:`Connection.tpc_recover` also carries ``prepared`` (when it was
+    prepared), ``owner`` and ``database``."""
+
+    __slots__ = ("format_id", "gtrid", "bqual", "prepared", "owner", "database")
+
+    def __init__(
+        self,
+        format_id: Optional[int],
+        gtrid: str,
+        bqual: Optional[str],
+        prepared: Optional[Any] = None,
+        owner: Optional[str] = None,
+        database: Optional[str] = None,
+    ) -> None:
+        self.format_id = format_id
+        self.gtrid = gtrid
+        self.bqual = bqual
+        self.prepared = prepared
+        self.owner = owner
+        self.database = database
+
+    @classmethod
+    def from_string(cls, gid: str) -> "Xid":
+        """The xid a gid stands for: a structured one when it is in the ``format_gtrid_bqual``
+        form :class:`Xid` writes, else a plain one holding the gid."""
+        match = _XID_FORM.fullmatch(gid)
+        if match is not None:
+            try:
+                gtrid = base64.b64decode(match.group(2), validate=True).decode("utf-8")
+                bqual = base64.b64decode(match.group(3), validate=True).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                pass
+            else:
+                xid = cls(int(match.group(1)), gtrid, bqual)
+                if str(xid) == gid:
+                    return xid
+        return cls(None, gid, None)
+
+    def __str__(self) -> str:
+        if self.format_id is None:
+            return self.gtrid
+        encode = lambda text: base64.b64encode(text.encode("utf-8")).decode("ascii")  # noqa: E731
+        return f"{self.format_id}_{encode(self.gtrid)}_{encode(self.bqual or '')}"
+
+    def _key(self) -> Tuple[Optional[int], str, Optional[str]]:
+        return (self.format_id, self.gtrid, self.bqual)
+
+    def __getitem__(self, index: int) -> Any:
+        return self._key()[index]
+
+    def __len__(self) -> int:
+        return 3
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._key())
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Xid):
+            return self._key() == other._key()
+        if isinstance(other, tuple):
+            return self._key() == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._key())
+
+    def __repr__(self) -> str:
+        return f"Xid({self.format_id!r}, {self.gtrid!r}, {self.bqual!r})"
+
+
+_XID_FORM = _re.compile(r"(\d+)_([A-Za-z0-9+/=]*)_([A-Za-z0-9+/=]*)")
+
+
+def _make_xid(format_id: int, gtrid: str, bqual: str) -> Xid:
+    """Check the parts of an xid (PEP-249: gtrid and bqual are at most 64 characters)."""
+    if isinstance(format_id, bool) or not isinstance(format_id, int) or not 0 <= format_id < 2**31:
+        raise ProgrammingError(f"format_id is a whole number below 2**31, not {format_id!r}")
+    for name, part in (("gtrid", gtrid), ("bqual", bqual)):
+        if not isinstance(part, str):
+            raise ProgrammingError(f"{name} is a str, not {type(part).__name__}")
+        if len(part) > 64:
+            raise ProgrammingError(f"{name} is at most 64 characters")
+    return Xid(format_id, gtrid, bqual)
+
+
+def _as_xid(xid: Any) -> Xid:
+    if isinstance(xid, Xid):
+        return xid
+    if isinstance(xid, str):
+        if not xid:
+            raise ProgrammingError("a transaction id cannot be empty")
+        return Xid.from_string(xid)
+    raise ProgrammingError(f"a transaction id is an Xid or a str, not {type(xid).__name__}")
+
+
+# The prepared transactions the server holds, for `tpc_recover`.
+_RECOVER_QUERY = "SELECT gid, prepared, owner, database FROM nusadb_prepared_xacts"
+
+
+def _recovered(rows: List[List[Optional[bytes]]], types: List[Optional[str]]) -> List[Xid]:
+    out = []
+    for row in rows:
+        gid, prepared, owner, database = (
+            Cursor._decode_cell(cell, type_code) for cell, type_code in zip(row, types)
+        )
+        xid = Xid.from_string(gid)
+        xid.prepared, xid.owner, xid.database = prepared, owner, database
+        out.append(xid)
+    return out
+
+
 class Notification(NamedTuple):
     """An asynchronous ``LISTEN``/``NOTIFY`` message delivered by the server."""
 
@@ -748,6 +963,8 @@ class Connection:
         connect_timeout: Optional[float] = None,
         statement_timeout: Optional[float] = None,
         keepalive: Optional[float] = None,
+        binary: bool = False,
+        prepare_threshold: Optional[int] = 5,
     ) -> None:
         self._user = user
         self._password = password
@@ -772,7 +989,23 @@ class Connection:
         self._notifications: List["Notification"] = []
         #: The default ``row_factory`` of this connection's cursors (``None``: tuples).
         self.row_factory: Optional[RowFactory] = None
-        self._statements: "OrderedDict[str, PreparedStatement]" = OrderedDict()
+        # Statements kept prepared: `prepare_cached` ones under their SQL text, automatically
+        # prepared ones under `(native sql, parameter type tags)`.
+        self._statements: "OrderedDict[Any, PreparedStatement]" = OrderedDict()
+        #: Whether this connection's cursors ask for results in the binary format by default.
+        self.binary = bool(binary)
+        self._prepare_threshold = _check_threshold(prepare_threshold)
+        # How many times each statement not (yet) prepared has run with parameters.
+        self._uses: "OrderedDict[Tuple[str, bytes], int]" = OrderedDict()
+        # Adapters registered on this connection only (see `nusadb.types.register_composite`).
+        self._adapters: Dict[type, Callable[[Any], Any]] = {}
+        #: The :class:`Notice` messages the server sent with its replies, oldest first (the last
+        #: :data:`MAX_NOTICES`). Clear it as needed. A server before protocol 1.3 sends none.
+        self.notices: List[Notice] = []
+        self._notice_handlers: List[Callable[[Notice], Any]] = []
+        # The two-phase transaction begun with `tpc_begin`, and whether it has been prepared.
+        self._tpc: Optional[Xid] = None
+        self._tpc_prepared = False
         # The open row stream (weakly held: one dropped unread is ended at the next call).
         self._stream: Optional["weakref.ReferenceType[RowStream]"] = None
         self._pipeline: Optional["Pipeline"] = None
@@ -817,42 +1050,67 @@ class Connection:
         name: Optional[str] = None,
         scrollable: Optional[bool] = None,
         withhold: bool = False,
+        binary: Optional[bool] = None,
     ) -> "Cursor":
         """A new cursor. ``row_factory`` (default: the connection's ``row_factory``) shapes the
-        rows it fetches; see :mod:`nusadb.rows`.
+        rows it fetches; see :mod:`nusadb.rows`. ``binary`` asks for results in the binary format
+        (default: the connection's :attr:`binary`); the values decode the same either way.
 
         With a ``name``, the cursor is a :class:`ServerCursor`: its query stays on the server and
         rows come over as they are fetched. ``scrollable`` declares it ``SCROLL`` (``True``) or
-        ``NO SCROLL`` (``False``); ``withhold`` keeps it open after its transaction commits."""
+        ``NO SCROLL`` (``False``); ``withhold`` keeps it open after its transaction commits. A named
+        cursor fetches in the text format: the server runs ``FETCH`` only as a simple query."""
         self._ensure_open()
         factory = row_factory if row_factory is not None else self.row_factory
         if name is not None:
+            if binary:
+                raise NotSupportedError(
+                    "a named cursor fetches in the text format; binary=True is not available"
+                )
             return ServerCursor(self, name, factory, scrollable, withhold)
-        return Cursor(self, factory)
+        return Cursor(self, factory, binary=self.binary if binary is None else binary)
 
-    def prepare(self, sql: str) -> "PreparedStatement":
-        """Parse ``sql`` once on the server; run it with :meth:`Cursor.execute` or
-        :meth:`Cursor.executemany` as many times as needed. Its parameter types are inferred from
-        the statement. The server stores the text as it is, so a mistake in it is reported when the
-        statement first runs. Free it with :meth:`PreparedStatement.close`."""
+    def prepare(self, sql: Any) -> "PreparedStatement":
+        """Parse ``sql`` (text or a :mod:`nusadb.sql` object) once on the server; run it with
+        :meth:`Cursor.execute` or :meth:`Cursor.executemany` as many times as needed. Its parameter
+        types are inferred from the statement. The server stores the text as it is, so a mistake in
+        it is reported when the statement first runs. Free it with
+        :meth:`PreparedStatement.close`."""
         self._ensure_open()
+        sql = _sql_text(sql, self)
         return PreparedStatement(self, self._prepare(sql), sql)
 
-    def prepare_cached(self, sql: str) -> "PreparedStatement":
+    def prepare_cached(self, sql: Any) -> "PreparedStatement":
         """:meth:`prepare`, reusing the statement already prepared for the same ``sql`` on this
         connection. Up to :data:`STATEMENT_CACHE_SIZE` statements are kept; past that the least
         recently used is closed."""
         self._ensure_open()
+        sql = _sql_text(sql, self)
         cached = self._statements.get(sql)
         if cached is not None and not cached.closed:
             self._statements.move_to_end(sql)
             return cached
         statement = self.prepare(sql)
         self._statements[sql] = statement
-        while len(self._statements) > STATEMENT_CACHE_SIZE:
-            _sql, oldest = self._statements.popitem(last=False)
-            oldest.close()
+        self._trim_statements()
         return statement
+
+    def _trim_statements(self) -> None:
+        """Close the least recently used prepared statements past :data:`STATEMENT_CACHE_SIZE`."""
+        while len(self._statements) > STATEMENT_CACHE_SIZE:
+            _key, oldest = self._statements.popitem(last=False)
+            if not self._broken and not self._closed:
+                oldest.close()
+
+    @property
+    def prepare_threshold(self) -> Optional[int]:
+        """How many times a statement runs with parameters before it is prepared on the server and
+        reused (``None``: never). See :func:`connect`."""
+        return self._prepare_threshold
+
+    @prepare_threshold.setter
+    def prepare_threshold(self, value: Optional[int]) -> None:
+        self._prepare_threshold = _check_threshold(value)
 
     def transaction(
         self, isolation: Optional[str] = None, read_only: Optional[bool] = None
@@ -868,16 +1126,26 @@ class Connection:
 
     def stream(
         self,
-        sql: str,
+        sql: Any,
         parameters: Sequence[Any] = (),
         batch_rows: int = 1024,
         row_factory: Optional["RowFactory"] = None,
+        *,
+        binary: Optional[bool] = None,
     ) -> "RowStream":
         """Run a query and read its rows ``batch_rows`` at a time, so a result of any size is
         never held whole on the client. The connection runs nothing else until the stream is read
-        to the end or closed (use it as a context manager)."""
+        to the end or closed (use it as a context manager). ``binary`` asks for the rows in the
+        binary format (default: the connection's :attr:`binary`)."""
         self._ensure_open()
-        return RowStream(self, sql, parameters, max(1, batch_rows), row_factory)
+        return RowStream(
+            self,
+            _sql_text(sql, self),
+            parameters,
+            max(1, batch_rows),
+            row_factory,
+            self.binary if binary is None else binary,
+        )
 
     def pipeline(self) -> "Pipeline":
         """A block whose statements are sent together: ``p.execute(sql, params)`` queues a
@@ -924,6 +1192,10 @@ class Connection:
         server rolled it back instead of committing it: its work is gone.
         """
         self._ensure_open()
+        if self._tpc is not None:
+            raise ProgrammingError(
+                "commit() is not allowed in a two-phase transaction; use tpc_commit()"
+            )
         if self._status == "I":
             return
         failed = self._status == "E"
@@ -937,6 +1209,10 @@ class Connection:
         """Roll back the open transaction, discarding its uncommitted changes. Nothing to do
         outside one."""
         self._ensure_open()
+        if self._tpc is not None:
+            raise ProgrammingError(
+                "rollback() is not allowed in a two-phase transaction; use tpc_rollback()"
+            )
         if self._status != "I":
             self._run_control("ROLLBACK")
 
@@ -970,6 +1246,98 @@ class Connection:
         if self._status == "I":
             raise ProgrammingError("no active transaction to release a savepoint")
         self._run_control("RELEASE SAVEPOINT " + _quote_identifier(name))
+
+    # --- two-phase commit (PEP-249 optional extension) ---
+
+    def xid(self, format_id: int, gtrid: str, bqual: str) -> Xid:
+        """A transaction id for :meth:`tpc_begin`: ``format_id`` a whole number below ``2**31``,
+        ``gtrid`` and ``bqual`` strings of at most 64 characters. A plain ``str`` gid works in
+        its place."""
+        return _make_xid(format_id, gtrid, bqual)
+
+    def tpc_begin(self, xid: Union[Xid, str]) -> None:
+        """Begin a two-phase transaction under ``xid`` (an :meth:`xid` or a gid string). It must
+        start outside a transaction; a transaction is opened at once, in autocommit mode too.
+        End it with :meth:`tpc_prepare` then :meth:`tpc_commit` or :meth:`tpc_rollback`; until
+        then :meth:`commit` and :meth:`rollback` are refused."""
+        self._ensure_open()
+        xid = _as_xid(xid)
+        if self._tpc is not None:
+            raise ProgrammingError("a two-phase transaction is already in progress")
+        if self._status != "I":
+            raise ProgrammingError("tpc_begin must be called outside a transaction")
+        self._run_control("BEGIN")
+        self._tpc, self._tpc_prepared = xid, False
+
+    def tpc_prepare(self) -> None:
+        """Prepare the two-phase transaction (``PREPARE TRANSACTION``): its work is kept on the
+        server, which can then commit or roll it back by its id, from any connection, even after a
+        restart. No statement may run on this connection until :meth:`tpc_commit` or
+        :meth:`tpc_rollback`."""
+        self._ensure_open()
+        if self._tpc is None:
+            raise ProgrammingError("tpc_prepare needs a transaction begun with tpc_begin")
+        if self._tpc_prepared:
+            raise ProgrammingError("the two-phase transaction is already prepared")
+        self._run_control("PREPARE TRANSACTION " + _quote_literal(str(self._tpc)))
+        self._tpc_prepared = True
+
+    def tpc_commit(self, xid: Union[Xid, str, None] = None) -> None:
+        """Commit a two-phase transaction. Without ``xid`` it is the one begun on this connection:
+        ``COMMIT PREPARED`` once prepared, else an ordinary one-phase commit. With ``xid`` (one
+        from :meth:`tpc_recover`, say) it is that prepared transaction, from outside a
+        transaction."""
+        self._tpc_end("COMMIT", xid)
+
+    def tpc_rollback(self, xid: Union[Xid, str, None] = None) -> None:
+        """Roll back a two-phase transaction, as :meth:`tpc_commit` commits one."""
+        self._tpc_end("ROLLBACK", xid)
+
+    def tpc_recover(self) -> List[Xid]:
+        """The transactions prepared on the server and not yet committed or rolled back, as xids
+        (with ``prepared``, ``owner`` and ``database`` set). Runs without opening a transaction."""
+        self._ensure_open()
+        _columns, types, rows, _tag = self._run_control(_RECOVER_QUERY)
+        return _recovered(rows, types)
+
+    def _tpc_end(self, action: str, xid: Union[Xid, str, None]) -> None:
+        self._ensure_open()
+        if xid is not None:
+            if self._tpc is not None:
+                raise ProgrammingError(
+                    f"tpc_{action.lower()} with an xid cannot run inside a two-phase transaction"
+                )
+            if self._status != "I":
+                raise ProgrammingError(
+                    f"tpc_{action.lower()} with an xid must be called outside a transaction"
+                )
+            self._run_control(f"{action} PREPARED " + _quote_literal(str(_as_xid(xid))))
+            return
+        if self._tpc is None:
+            raise ProgrammingError(f"tpc_{action.lower()} needs a transaction begun with tpc_begin")
+        try:
+            if self._tpc_prepared:
+                self._run_control(f"{action} PREPARED " + _quote_literal(str(self._tpc)))
+            elif self._status != "I":
+                failed = self._status == "E"
+                _columns, _types, _rows, tag = self._run_control(action)
+                if action == "COMMIT" and (failed or tag == "ROLLBACK"):
+                    raise TransactionRolledBack(
+                        "a statement in the transaction failed, so COMMIT rolled it back"
+                    )
+        finally:
+            self._tpc, self._tpc_prepared = None, False
+
+    # --- notices ---
+
+    def add_notice_handler(self, handler: Callable[[Notice], Any]) -> None:
+        """Call ``handler(notice)`` for each :class:`Notice` the server sends from now on, as it
+        arrives (also kept in :attr:`notices`). An exception it raises becomes a warning."""
+        self._notice_handlers.append(handler)
+
+    def remove_notice_handler(self, handler: Callable[[Notice], Any]) -> None:
+        """Stop calling ``handler``; raises ``ValueError`` when it was not added."""
+        self._notice_handlers.remove(handler)
 
     # --- asynchronous notifications (LISTEN/NOTIFY) ---
 
@@ -1011,28 +1379,36 @@ class Connection:
         self._ensure_open()
         if self._notifications:
             return self._notifications.pop(0)
-        # Wait for the first byte without reading any, so a timeout never cuts a message in half.
-        pending = isinstance(self._sock, ssl_module.SSLSocket) and self._sock.pending() > 0
-        if not pending:
-            try:
-                ready, _, _ = select.select([self._sock], [], [], timeout)
-            except (OSError, ValueError) as exc:
-                self._fail()
-                raise OperationalError(f"waiting for a notification failed: {exc}") from exc
-            if not ready:
-                return None
-        # Interrupted part way through the message, the connection could not be read again.
-        self._pending = True
-        mtype, r = self._read_message()
-        self._pending = False
-        if mtype == proto.B_NOTIFICATION_RESPONSE:
-            return _decode_notification(r)
-        if mtype == proto.B_ERROR:
-            raise from_sqlstate(r.string(), r.string())
-        self._fail()
-        raise InterfaceError(
-            "unexpected message %r while polling for notifications" % chr(mtype)
-        )
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            # Wait for the first byte without reading any, so a timeout never cuts a message in
+            # half.
+            pending = isinstance(self._sock, ssl_module.SSLSocket) and self._sock.pending() > 0
+            if not pending:
+                wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+                try:
+                    ready, _, _ = select.select([self._sock], [], [], wait)
+                except (OSError, ValueError) as exc:
+                    self._fail()
+                    raise OperationalError(f"waiting for a notification failed: {exc}") from exc
+                if not ready:
+                    return None
+            # Interrupted part way through the message, the connection could not be read again.
+            self._pending = True
+            mtype, r = self._read_one()
+            self._pending = False
+            if mtype == proto.B_NOTICE_RESPONSE:
+                # A notice on an idle connection: keep it, and go on waiting for a notification.
+                _deliver_notice(self, r)
+                continue
+            if mtype == proto.B_NOTIFICATION_RESPONSE:
+                return _decode_notification(r)
+            if mtype == proto.B_ERROR:
+                raise from_sqlstate(r.string(), r.string())
+            self._fail()
+            raise InterfaceError(
+                "unexpected message %r while polling for notifications" % chr(mtype)
+            )
 
     def _run_control(self, sql: str) -> "_Result":
         """Send a transaction-control statement (`BEGIN`/`COMMIT`/`ROLLBACK`) directly."""
@@ -1040,7 +1416,11 @@ class Connection:
         return self._read_until_ready()
 
     def _begin_if_needed(self) -> None:
-        """Open a transaction before the first statement when not in autocommit mode."""
+        """Open a transaction before the first statement when not in autocommit mode. Refused
+        while a prepared two-phase transaction waits for :meth:`tpc_commit` or
+        :meth:`tpc_rollback`."""
+        if self._tpc_prepared:
+            raise ProgrammingError(_TPC_PREPARED)
         if not self._autocommit and self._status == "I":
             self._run_control("BEGIN")
 
@@ -1175,6 +1555,15 @@ class Connection:
         return b"".join(chunks)
 
     def _read_message(self) -> Tuple[int, proto.Reader]:
+        """The next message of a reply. A notice, which can come anywhere in one, is delivered
+        (see :attr:`notices`) and skipped."""
+        while True:
+            mtype, r = self._read_one()
+            if mtype != proto.B_NOTICE_RESPONSE:
+                return mtype, r
+            _deliver_notice(self, r)
+
+    def _read_one(self) -> Tuple[int, proto.Reader]:
         # Set while a message is half read: stopped there, the socket's next bytes are not a
         # message header, and only dropping the connection gets back in step.
         self._mid_message = True
@@ -1240,7 +1629,9 @@ class Connection:
         if not _scram.verify_server_final(r.rest().decode("utf-8"), expected):
             raise OperationalError("server signature did not verify")
 
-    def _read_until_ready(self) -> _Result:
+    def _read_until_ready(self, on_parse: Optional[Callable[[], None]] = None) -> _Result:
+        """Read a reply through its ``ReadyForQuery``, raising the error it carried. ``on_parse`` is
+        called on a ``ParseComplete``."""
         columns: List[str] = []
         column_types: List[Optional[str]] = []
         rows: List[List[Optional[bytes]]] = []
@@ -1248,7 +1639,9 @@ class Connection:
         error: Optional[Tuple[str, str]] = None
         while True:
             mtype, r = self._read_message()
-            if mtype in (proto.B_ROW_DESCRIPTION, proto.B_ROW_DESCRIPTION_TYPED):
+            if mtype == proto.B_PARSE_COMPLETE and on_parse is not None:
+                on_parse()
+            elif mtype in (proto.B_ROW_DESCRIPTION, proto.B_ROW_DESCRIPTION_TYPED):
                 columns, column_types = _read_description(mtype, r)
             elif mtype == proto.B_DATA_ROW:
                 rows.append(r.fields())
@@ -1272,16 +1665,86 @@ class Connection:
         self._send(proto.query(sql))
         return self._read_until_ready()
 
-    def _extended_query(self, sql: str, params: Sequence[Any]) -> _Result:
+    def _extended_query(
+        self, sql: str, params: Sequence[Any], binary: bool = False, auto: bool = True
+    ) -> _Result:
+        """Run ``sql`` with ``params`` through Parse, Bind and Execute. With ``auto`` a statement
+        that has run :attr:`prepare_threshold` times is prepared on the server and reused."""
         self._begin_if_needed()
         compiled = _compile(sql)
-        encoded, tags = _bind(_arrange(compiled, params))
-        self._send(proto.parse("", compiled.sql, tags))
-        self._send(proto.bind("", "", encoded))
+        with _scoped_adapters(self._adapters):
+            encoded, tags = _bind(_arrange(compiled, params))
+        key = (compiled.sql, tags)
+        name, parse = self._auto_statement(key) if auto else (None, False)
+        if name is None:
+            return self._run_unnamed(compiled.sql, tags, encoded, binary)
+        if parse:
+            self._send(proto.parse(name, compiled.sql, tags))
+        self._send(proto.bind("", name, encoded, binary))
+        self._send(proto.describe_portal(""))
+        self._send(proto.execute("", 0))
+        self._send(proto.sync())
+        try:
+            return self._read_until_ready(
+                lambda: self._remember(key, name, compiled.sql) if parse else None
+            )
+        except DatabaseError as exc:
+            if parse or getattr(exc, "sqlstate", None) != _UNKNOWN_STATEMENT:
+                raise
+            # The server no longer knows the statement: forget it, and run the statement unprepared
+            # once, unless the error failed the transaction (then nothing more may run in it).
+            self._forget(key)
+            if self._status == "E":
+                raise
+            return self._run_unnamed(compiled.sql, tags, encoded, binary)
+        finally:
+            if parse:
+                self._trim_statements()
+
+    def _run_unnamed(
+        self, sql: str, tags: bytes, encoded: List[Optional[bytes]], binary: bool
+    ) -> _Result:
+        self._send(proto.parse("", sql, tags))
+        self._send(proto.bind("", "", encoded, binary))
         self._send(proto.describe_portal(""))
         self._send(proto.execute("", 0))
         self._send(proto.sync())
         return self._read_until_ready()
+
+    def _extended_plain(self, sql: str, binary: bool) -> _Result:
+        """Run ``sql``, which takes no parameters, through Parse and Bind (so its result can come in
+        the binary format). The text is sent as it is: no placeholder is rewritten."""
+        self._begin_if_needed()
+        return self._run_unnamed(sql, b"", [], binary)
+
+    def _auto_statement(self, key: Tuple[str, bytes]) -> Tuple[Optional[str], bool]:
+        """The prepared statement to run ``key`` (native SQL and parameter tags) under, and whether
+        it must be parsed now: ``(None, False)`` while the statement has run fewer than
+        :attr:`prepare_threshold` times, then a new name to parse, then that name."""
+        threshold = self._prepare_threshold
+        if threshold is None:
+            return None, False
+        cached = self._statements.get(key)
+        if cached is not None and not cached.closed:
+            self._statements.move_to_end(key)
+            return cached.name, False
+        uses = self._uses.pop(key, 0)
+        if uses < threshold:
+            self._uses[key] = uses + 1
+            while len(self._uses) > _USES_TRACKED:
+                self._uses.popitem(last=False)
+            return None, False
+        return f"nusadb_auto_{next(self._names)}", True
+
+    def _remember(self, key: Tuple[str, bytes], name: str, sql: str) -> None:
+        """Keep the statement just prepared as ``name`` for reuse."""
+        self._statements[key] = PreparedStatement(self, name, sql)
+
+    def _forget(self, key: Tuple[str, bytes]) -> None:
+        """Drop a prepared statement the server no longer has (no ``Close`` is sent for it)."""
+        stale = self._statements.pop(key, None)
+        if stale is not None:
+            stale.closed = True
 
     def _prepare(self, sql: str) -> str:
         name = f"nusadb_stmt_{next(self._names)}"
@@ -1292,19 +1755,26 @@ class Connection:
 
     # --- COPY bulk load / export (wire-protocol.md §12) ---
 
-    def copy_in(self, sql: str, source: "BinaryIO") -> int:
+    def copy_in(self, sql: Any, source: "BinaryIO") -> int:
         r"""Bulk-load via ``COPY ... FROM STDIN`` (§12.1).
 
         Stream ``source`` (a binary file-like whose ``read(size)`` yields bytes already in the
-        server's text format: tab-delimited fields, ``\N`` for SQL NULL, one row per line) as
-        ``CopyData`` frames, then finish. Returns the number of rows loaded. A read error on
-        ``source`` sends ``CopyFail`` and leaves the connection ready; a refused COPY (bad SQL, an
-        RLS-protected table) raises the server error.
+        statement's format, by default the server's text format: tab-delimited fields, ``\N`` for
+        SQL NULL, one row per line) as ``CopyData`` frames, then finish. Returns the number of rows
+        loaded. A read error on ``source`` sends ``CopyFail`` and leaves the connection ready; a
+        refused COPY (bad SQL, an RLS-protected table) raises the server error.
         """
+        return self._copy_in(_sql_text(sql, self), source, None)
+
+    def _copy_in(self, sql: str, source: "BinaryIO", expected_format: Optional[int]) -> int:
         self._ensure_open()
         self._begin_if_needed()
         self._send(proto.query(sql))
-        self._await_copy_start(proto.B_COPY_IN)
+        copy_format = self._await_copy_start(proto.B_COPY_IN)
+        if expected_format is not None and copy_format != expected_format:
+            self._send(proto.copy_fail("nusadb: COPY format does not match the call"))
+            self._drain_to_ready()
+            raise ProgrammingError(_format_mismatch(expected_format))
         while True:
             try:
                 chunk = source.read(65536)
@@ -1323,17 +1793,23 @@ class Connection:
         self._send(proto.copy_done())
         return self._finish_copy()
 
-    def copy_out(self, sql: str, sink: "BinaryIO") -> int:
+    def copy_out(self, sql: Any, sink: "BinaryIO") -> int:
         r"""Bulk-export via ``COPY ... TO STDOUT`` (§12.2).
 
         Write each ``CopyData`` chunk the server streams into ``sink`` (a binary file-like with
-        ``write(bytes)``); the bytes are in the server's text format (tab-delimited, ``\N`` for
-        NULL). Returns the number of rows exported.
+        ``write(bytes)``); the bytes are in the statement's format, by default the server's text
+        format (tab-delimited, ``\N`` for NULL). Returns the number of rows exported.
         """
+        return self._copy_out(_sql_text(sql, self), sink, None)
+
+    def _copy_out(self, sql: str, sink: Any, expected_format: Optional[int]) -> int:
         self._ensure_open()
         self._begin_if_needed()
         self._send(proto.query(sql))
-        self._await_copy_start(proto.B_COPY_OUT)
+        copy_format = self._await_copy_start(proto.B_COPY_OUT)
+        if expected_format is not None and copy_format != expected_format:
+            self._drain_to_ready()
+            raise ProgrammingError(_format_mismatch(expected_format))
         while True:
             mtype, r = self._read_message()
             if mtype == proto.B_COPY_DATA:
@@ -1346,34 +1822,76 @@ class Connection:
                 raise from_sqlstate(*error)
         return self._finish_copy()
 
-    def copy_in_rows(self, sql: str, rows: Iterable[Sequence[Any]]) -> int:
-        """Bulk-load Python rows via ``COPY ... FROM STDIN`` in the default text format.
+    def copy_in_rows(
+        self,
+        sql: Any,
+        rows: Iterable[Sequence[Any]],
+        binary: bool = False,
+        types: Optional[Sequence[str]] = None,
+    ) -> int:
+        """Bulk-load Python rows via ``COPY ... FROM STDIN``.
 
-        Each row is a sequence of values, written as they would bind as parameters (``None`` is
-        NULL, a ``list`` an array, a ``dict`` JSON, ``bytes`` binary). ``rows`` is read lazily, so
-        a generator streams a load of any size. Returns the number of rows loaded. A row that
-        cannot be written (a value of an unsupported type, say) ends the COPY with nothing loaded
-        and raises; the connection stays usable. The statement must not set ``FORMAT``,
-        ``DELIMITER`` or ``NULL``.
+        Each row is a sequence of values. In the default text format they are written as they
+        would bind as parameters (``None`` is NULL, a ``list`` an array, a ``dict`` JSON, ``bytes``
+        binary); the statement must not set ``FORMAT``, ``DELIMITER`` or ``NULL``.
+
+        With ``binary=True`` the statement must say ``WITH (FORMAT binary)``, and each value is
+        written in the binary layout of its column's type: ``types`` names them in column order
+        (``["INT", "TEXT", "DATE"]``, ``"int4range"``, ``"text[]"``, ...). Without ``types`` each
+        column's type follows from its Python values (``int`` is ``INT``, ``str`` is ``TEXT``, an
+        aware ``datetime`` is ``TIMESTAMPTZ``, ...), and a column whose values do not agree is
+        refused. A binary field carries no type, so name the types whenever a column's type is not
+        the one its Python values map to (an ``int`` for a ``FLOAT`` column, say).
+
+        ``rows`` is read lazily, so a generator streams a load of any size. Returns the number of
+        rows loaded. A row that cannot be written ends the COPY with nothing loaded and raises; the
+        connection stays usable.
         """
-        return self.copy_in(sql, _ChunkReader(_copy_text_chunks(rows)))
+        sql = _sql_text(sql, self)
+        if binary:
+            writer = _binary.CopyWriter(types, _adapt, _encode_param)
+            chunks = _binary.copy_binary_chunks(rows, writer)
+        else:
+            if types is not None:
+                raise ProgrammingError("types= applies to a binary COPY (binary=True)")
+            chunks = _copy_text_chunks(rows)
+        with _scoped_adapters(self._adapters):
+            return self._copy_in(sql, _ChunkReader(chunks), 1 if binary else 0)
 
-    def copy_out_rows(self, sql: str) -> List[Tuple[Optional[str], ...]]:
-        """Export via ``COPY ... TO STDOUT`` in the default text format, as a list of rows: a tuple
-        per row of each field's text, ``None`` for NULL. The statement must not set ``FORMAT``,
-        ``DELIMITER`` or ``NULL``. For an export too large to hold, use :meth:`copy_out`."""
+    def copy_out_rows(
+        self, sql: Any, binary: bool = False, types: Optional[Sequence[str]] = None
+    ) -> List[Tuple[Any, ...]]:
+        """Export via ``COPY ... TO STDOUT`` as a list of rows. For an export too large to hold,
+        use :meth:`copy_out`.
+
+        In the default text format each row is a tuple of each field's text, ``None`` for NULL;
+        the statement must not set ``FORMAT``, ``DELIMITER`` or ``NULL``.
+
+        With ``binary=True`` the statement must say ``WITH (FORMAT binary)``. Each field is decoded
+        at its column's type in ``types`` (as for :meth:`copy_in_rows`) into the Python value a
+        query returns for it; without ``types`` a field stays its raw ``bytes``. The stream is
+        checked strictly (signature, flags, row widths, lengths, trailer), and a fault raises
+        :class:`InterfaceError` once the COPY has ended."""
+        sql = _sql_text(sql, self)
+        if binary:
+            reader = _binary.CopyReader(types, Cursor._decode_binary_cell)
+            self._copy_out(sql, reader, 1)
+            return reader.finish()
+        if types is not None:
+            raise ProgrammingError("types= applies to a binary COPY (binary=True)")
         lines = _CopyLines()
-        self.copy_out(sql, _SinkWriter(lines))
+        self._copy_out(sql, _SinkWriter(lines), 0)
         return lines.finish()
 
-    def _await_copy_start(self, expected: int) -> None:
-        """Read until the expected ``CopyInResponse``/``CopyOutResponse``; a refused COPY arrives as
-        ``Error`` then ``ReadyForQuery`` and is raised, the connection left ready."""
+    def _await_copy_start(self, expected: int) -> int:
+        """Read until the expected ``CopyInResponse``/``CopyOutResponse`` and return its overall
+        format (``0`` text, ``1`` binary); a refused COPY arrives as ``Error`` then
+        ``ReadyForQuery`` and is raised, the connection left ready."""
         error: Optional[Tuple[str, str]] = None
         while True:
             mtype, r = self._read_message()
             if mtype == expected:
-                return
+                return r.u8() if r.remaining() else 0
             if mtype in (proto.B_COPY_IN, proto.B_COPY_OUT):
                 # The statement copies the other way: end that COPY and leave the connection ready.
                 if mtype == proto.B_COPY_IN:
@@ -1415,10 +1933,11 @@ class Connection:
                 r.u8()
                 return
 
-    def _query_prepared(self, name: str, params: Sequence[Any]) -> _Result:
+    def _query_prepared(self, name: str, params: Sequence[Any], binary: bool = False) -> _Result:
         self._begin_if_needed()
-        encoded, _tags = _bind(params)
-        self._send(proto.bind("", name, encoded))
+        with _scoped_adapters(self._adapters):
+            encoded, _tags = _bind(params)
+        self._send(proto.bind("", name, encoded, binary))
         self._send(proto.describe_portal(""))
         self._send(proto.execute("", 0))
         self._send(proto.sync())
@@ -1439,7 +1958,7 @@ class Connection:
         sql = compiled.sql
         total, counted = 0, False
         rows = (_arrange(compiled, parameters) for parameters in seq_of_parameters)
-        for chunk, failure in _bound_chunks(rows):
+        for chunk, failure in _bound_chunks(rows, self._adapters):
             if chunk:
                 got, any_count = self._send_batch(sql, chunk)
                 total, counted = total + got, counted or any_count
@@ -1551,28 +2070,35 @@ class Pipeline:
 
     def execute(
         self,
-        sql: str,
+        sql: Any,
         parameters: Any = (),
         row_factory: Optional["RowFactory"] = None,
+        *,
+        binary: Optional[bool] = None,
     ) -> "Cursor":
         """Queue ``sql`` with ``parameters`` (any placeholder style the connection takes) and
-        return the cursor its result will be loaded into at the next sync."""
+        return the cursor its result will be loaded into at the next sync. ``binary`` asks for the
+        result in the binary format (default: the connection's :attr:`~Connection.binary`)."""
         if not self._active:
             raise ProgrammingError("use the pipeline as a context manager: with conn.pipeline() as p")
         conn = self._conn
         if conn._broken or conn._closed:
             conn._ensure_open()
-        compiled = _compile(sql)
-        encoded, tags = _bind(_arrange(compiled, parameters))
+        binary = conn.binary if binary is None else binary
+        compiled = _compile(_sql_text(sql, conn))
+        with _scoped_adapters(conn._adapters):
+            encoded, tags = _bind(_arrange(compiled, parameters))
         frames = b"".join(
             (
                 proto.parse("", compiled.sql, tags),
-                proto.bind("", "", encoded),
+                proto.bind("", "", encoded, binary),
                 proto.describe_portal(""),
                 proto.execute("", 0),
             )
         )
-        cursor = Cursor(conn, row_factory if row_factory is not None else conn.row_factory)
+        cursor = Cursor(
+            conn, row_factory if row_factory is not None else conn.row_factory, binary=binary
+        )
         self._queued.append((frames, cursor))
         self._size += len(frames)
         if len(self._queued) >= PIPELINE_SYNC_STATEMENTS or self._size >= _COPY_CHUNK:
@@ -1601,7 +2127,8 @@ class Pipeline:
             elif mtype == proto.B_DATA_ROW:
                 rows.append(r.fields())
             elif mtype == proto.B_COMMAND_COMPLETE:
-                next(cursors)._load(columns, column_types, rows, r.string())
+                cursor = next(cursors)
+                cursor._load(columns, column_types, rows, r.string(), cursor.binary)
                 columns, column_types, rows = [], [], []
             elif mtype == proto.B_ERROR:
                 error = (r.string(), r.string())
@@ -1620,11 +2147,18 @@ class Cursor:
     """
 
     def __init__(
-        self, connection: Connection, row_factory: Optional["RowFactory"] = None
+        self,
+        connection: Connection,
+        row_factory: Optional["RowFactory"] = None,
+        binary: bool = False,
     ) -> None:
         self._conn = connection
         #: Builds each fetched row from the cursor (see :mod:`nusadb.rows`); ``None`` for tuples.
         self.row_factory = row_factory
+        #: Whether :meth:`execute` asks for results in the binary format (wire-protocol §11.2).
+        self.binary = binary
+        # Whether the result loaded now is in the binary format.
+        self._result_binary = False
         self._make_row: Optional[Callable[[Tuple[Any, ...]], Any]] = None
         self._rows: List[List[Optional[bytes]]] = []
         self._pos = 0
@@ -1660,28 +2194,42 @@ class Cursor:
 
     def execute(
         self,
-        operation: Union[str, "PreparedStatement"],
+        operation: Union[str, "PreparedStatement", Any],
         parameters: Optional[Sequence[Any]] = None,
+        *,
+        binary: Optional[bool] = None,
     ) -> "Cursor":
-        """Run ``operation``: SQL text, or a statement from :meth:`Connection.prepare`."""
+        """Run ``operation``: SQL text, a :mod:`nusadb.sql` object, or a statement from
+        :meth:`Connection.prepare`. ``binary`` asks for this result in the binary format (default:
+        the cursor's :attr:`binary`). A binary result needs the statement to run through Parse and
+        Bind, so a statement without parameters goes that way too, unless it is one the server runs
+        only as a simple query (``DECLARE``, ``FETCH``, ``MOVE``, ``CLOSE``, ``COPY``, or several
+        statements in one string), which comes back in text."""
         self._check()
+        binary = self.binary if binary is None else binary
+        conn = self._conn
         if isinstance(operation, PreparedStatement):
-            result = self._conn._query_prepared(
+            result = conn._query_prepared(
                 self._statement_name(operation),
                 _arrange(operation._compiled, parameters or ()),
+                binary,
             )
-            self._load(*result)
+            self._load(*result, binary)
             return self
+        operation = _sql_text(operation, conn)
         if parameters:
-            columns, column_types, rows, tag = self._conn._extended_query(operation, parameters)
+            result = conn._extended_query(operation, parameters, binary)
+        elif binary and not _needs_simple_query(operation):
+            result = conn._extended_plain(operation, True)
         else:
-            columns, column_types, rows, tag = self._conn._simple_query(operation)
-        self._load(columns, column_types, rows, tag)
+            result = conn._simple_query(operation)
+            binary = False
+        self._load(*result, binary)
         return self
 
     def executemany(
         self,
-        operation: Union[str, "PreparedStatement"],
+        operation: Union[str, "PreparedStatement", Any],
         seq_of_parameters: Sequence[Sequence[Any]],
     ) -> None:
         """Run ``operation`` once per parameter set. The executions are pipelined (sent in
@@ -1689,6 +2237,8 @@ class Cursor:
         than one per row. The first error stops the batch and is raised; in autocommit mode the
         statements before it have each been committed."""
         self._check()
+        if not isinstance(operation, PreparedStatement):
+            operation = _sql_text(operation, self._conn)
         if isinstance(operation, PreparedStatement):
             total, counted = 0, False
             for parameters in seq_of_parameters:
@@ -1716,7 +2266,8 @@ class Cursor:
         row = self._rows[self._pos]
         self._pos += 1
         types = self._column_types or [None] * len(row)
-        values = tuple(self._decode_cell(cell, type_code) for cell, type_code in zip(row, types))
+        decode = self._decode_binary_cell if self._result_binary else self._decode_cell
+        values = tuple(decode(cell, type_code) for cell, type_code in zip(row, types))
         if self.row_factory is None:
             return values
         if self._make_row is None:
@@ -1804,11 +2355,13 @@ class Cursor:
         column_types: List[Optional[str]],
         rows: List[List[Optional[bytes]]],
         tag: Optional[str],
+        binary: bool = False,
     ) -> None:
         self._columns = columns
         self._column_types = column_types
         self._rows = rows
         self._pos = 0
+        self._result_binary = binary
         self._make_row = None
         # For a SELECT, rowcount is the number of rows; for DML, the affected count.
         self.rowcount = len(rows) if columns else _affected(tag)
@@ -1859,6 +2412,22 @@ class Cursor:
             # Malformed for its declared tag → return the raw text rather than failing the fetch.
             return text
 
+    @classmethod
+    def _decode_binary_cell(cls, cell: Optional[bytes], type_code: Optional[str] = None) -> Any:
+        """Decode a binary-format field (wire-protocol §11.2) into the same Python value its text
+        form decodes to. The types whose binary form is their text (``NUMERIC``, ``TEXT``,
+        ``JSON``, arrays, ``VECTOR``, ...) go through :meth:`_decode_cell`, registered decoders
+        included. A field that does not fit its type's layout raises :class:`InterfaceError`."""
+        if cell is None:
+            return None
+        decode = _binary.DECODERS.get(type_code) if type_code is not None else None
+        if decode is None:
+            return cls._decode_cell(cell, type_code)
+        try:
+            return decode(cell)
+        except (ValueError, struct.error) as exc:
+            raise InterfaceError(f"malformed binary {type_code} value: {exc}") from None
+
 
 _DEFAULTS = {
     "host": "127.0.0.1",
@@ -1872,6 +2441,8 @@ _DEFAULTS = {
     "connect_timeout": None,
     "statement_timeout": None,
     "keepalive": None,
+    "binary": False,
+    "prepare_threshold": 5,
 }
 
 
@@ -1910,18 +2481,19 @@ class ServerCursor(Cursor):
         self.rownumber: Optional[int] = None
 
     def execute(  # type: ignore[override]
-        self, operation: str, parameters: Optional[Any] = None
+        self, operation: Any, parameters: Optional[Any] = None
     ) -> "ServerCursor":
         """Declare the cursor for ``operation`` (a query), closing the one declared before."""
         self._check()
-        if not isinstance(operation, str):
+        if isinstance(operation, PreparedStatement):
             raise NotSupportedError("a named cursor takes SQL text, not a prepared statement")
+        operation = _sql_text(operation, self._conn)
         self._close_on_server()
         scroll = {None: "", True: "SCROLL ", False: "NO SCROLL "}[self.scrollable]
         hold = " WITH HOLD" if self.withhold else ""
         sql = f"DECLARE {_quote_identifier(self.name)} {scroll}CURSOR{hold} FOR {operation}"
         if parameters:
-            self._conn._extended_query(sql, parameters)
+            self._conn._extended_query(sql, parameters, auto=False)
         else:
             self._conn._simple_query(sql)
         self._declared = True
@@ -2074,6 +2646,11 @@ def connect(dsn: Optional[str] = None, *args: Any, **kwargs: Any) -> Connection:
     * ``autocommit``: ``True`` (the default) runs each statement on its own; ``False`` opens a
       transaction before the first statement, ended by :meth:`Connection.commit` or
       :meth:`Connection.rollback`
+    * ``binary``: ``True`` makes the connection's cursors ask for results in the binary format
+      (default ``False``); the values decode to the same Python objects either way
+    * ``prepare_threshold``: after a statement has run this many times with parameters on the
+      connection it is prepared on the server and reused (default 5; ``None`` never, ``0`` from
+      the first run)
 
     A first argument that is not a URL is a host, and further positional arguments follow the
     order ``host, port, user, database, password, ssl, timeout, autocommit``.
@@ -2111,6 +2688,8 @@ def connect(dsn: Optional[str] = None, *args: Any, **kwargs: Any) -> Connection:
             connect_timeout=options["connect_timeout"],
             statement_timeout=options["statement_timeout"],
             keepalive=options["keepalive"],
+            binary=options["binary"],
+            prepare_threshold=options["prepare_threshold"],
         )
     except (OSError, DatabaseError):
         raise
@@ -2127,8 +2706,33 @@ def _set_keepalive(sock: socket.socket, idle: float) -> None:
         sock.setsockopt(socket.IPPROTO_TCP, option, max(1, math.ceil(idle)))
 
 
-#: How many statements :meth:`Connection.prepare_cached` keeps per connection.
+#: How many prepared statements a connection keeps: those of :meth:`Connection.prepare_cached`
+#: and those prepared automatically (see ``prepare_threshold`` in :func:`connect`).
 STATEMENT_CACHE_SIZE = 256
+
+# How many statements not yet prepared a connection counts the runs of.
+_USES_TRACKED = 1024
+
+# SQLSTATE of a prepared statement the server does not know.
+_UNKNOWN_STATEMENT = "26000"
+
+_TPC_PREPARED = (
+    "the two-phase transaction is prepared; end it with tpc_commit() or tpc_rollback() first"
+)
+
+
+def _check_threshold(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProgrammingError(f"prepare_threshold is a whole number or None, not {value!r}")
+    return value
+
+
+def _format_mismatch(expected: int) -> str:
+    if expected == 1:
+        return "binary=True needs a binary COPY: add WITH (FORMAT binary) to the statement"
+    return "the statement is a binary COPY: pass binary=True"
 
 # How many executions :meth:`Cursor.executemany` sends before reading their replies.
 _BATCH_ROWS = 256
@@ -2242,20 +2846,22 @@ class RowStream:
         parameters: Sequence[Any],
         batch_rows: int,
         row_factory: Optional[RowFactory],
+        binary: bool = False,
     ) -> None:
         self._conn = connection
         self._batch = batch_rows
         # Decoding and row building are a cursor's; this one only holds the current batch.
         self._cursor = Cursor(
-            connection, row_factory if row_factory is not None else connection.row_factory
+            connection, row_factory if row_factory is not None else connection.row_factory, binary
         )
         self._done = False
         self.rowcount = -1
         connection._begin_if_needed()
         compiled = _compile(sql)
-        encoded, tags = _bind(_arrange(compiled, parameters))
+        with _scoped_adapters(connection._adapters):
+            encoded, tags = _bind(_arrange(compiled, parameters))
         connection._send(proto.parse("", compiled.sql, tags))
-        connection._send(proto.bind("", "", encoded))
+        connection._send(proto.bind("", "", encoded, binary))
         connection._send(proto.describe_portal(""))
         connection._send(proto.execute("", batch_rows))
         connection._stream = weakref.ref(self)
@@ -2279,10 +2885,11 @@ class RowStream:
                 for _ in range(count):
                     columns.append(r.string())
                     types.append(proto.type_name(r.u8()))
-                self._cursor._load(columns, types, [], None)
+                self._cursor._load(columns, types, [], None, self._cursor.binary)
             elif mtype == proto.B_ROW_DESCRIPTION:
                 count = r.u16()
-                self._cursor._load([r.string() for _ in range(count)], [None] * count, [], None)
+                names = [r.string() for _ in range(count)]
+                self._cursor._load(names, [None] * count, [], None, self._cursor.binary)
             elif mtype == proto.B_DATA_ROW:
                 rows.append(r.fields())
             elif mtype == proto.B_PORTAL_SUSPENDED:

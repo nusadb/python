@@ -26,9 +26,33 @@
 - The SQLAlchemy dialect needs SQLAlchemy 2.0. `metadata.create_all` now emits the server's own
   types (`VARCHAR(n)`, `NUMERIC(p, s)`, `DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`, `BYTEA`,
   `UUID`, `JSONB`) and an identity column for an autoincrementing integer primary key.
+- A statement that has run five times with parameters on a connection is prepared on the server
+  and reused (`prepare_threshold=None` turns this off).
+- The driver asks for protocol 1.3, for notices; a server with a lower minor answers at its own.
 
 ### Added
 
+- `nusadb.sql`: build SQL from pieces with `SQL`, `Identifier`, `Literal`, `Placeholder` and
+  `Composed`, `SQL.format()` with `{}`, `{0}` and `{name}` fields, `SQL.join()` and `+`.
+  Identifiers and literals are quoted so that nothing they hold can change the statement. Every
+  method that takes SQL text takes these too, sync and asyncio.
+- Binary results: `connect(binary=True)` (also `?binary=true`), `cursor(binary=True)`,
+  `execute(..., binary=True)` and `stream(..., binary=True)` ask for the binary format and decode
+  every type to the same Python value as the text format, sync and asyncio.
+- Binary `COPY`: `copy_in_rows(sql, rows, binary=True, types=[...])` writes the binary stream, each
+  value in its column type's layout (types named, or taken from the Python values), and
+  `copy_out_rows(sql, binary=True, types=[...])` reads one into typed values, checking it strictly.
+- Composite types: `nusadb.CompositeInfo` (`fetch`, `fetch_async`, `load`, `dump`),
+  `nusadb.register_composite` to bind objects as records, and the `nusadb.rows.composite_row` row
+  factory.
+- Automatic server-side prepare with the `prepare_threshold` option (default 5; also a URL option,
+  a connection property and a Django `OPTIONS` key), sharing the `STATEMENT_CACHE_SIZE` cache. A
+  statement the server no longer knows is dropped and run unprepared once, outside a failed
+  transaction.
+- Two-phase commit: `xid()`, `tpc_begin`, `tpc_prepare`, `tpc_commit`, `tpc_rollback` and
+  `tpc_recover`, with `nusadb.Xid`, sync and asyncio.
+- Notices: `conn.notices` holds the `nusadb.Notice` messages the server sends (protocol 1.3), and
+  `add_notice_handler` / `remove_notice_handler` register callbacks, sync and asyncio.
 - `pyformat` placeholders: `%s` by position and `%(name)s` from a mapping (a name may repeat),
   with `%%` for a literal `%`, in `execute`, `executemany`, prepared statements and `stream`, sync
   and asyncio alike. The native `$1` and the `numeric` `:1` work as before.
@@ -68,6 +92,13 @@
 - `nusadb.Json(value)` to send a value as JSON.
 
 ### Fixed
+
+- `copy_in_rows` in the text format applies registered adapters, as parameters do.
+- `copy_in_rows` and `copy_out_rows` check the statement's `COPY` format and raise
+  `ProgrammingError` when it does not match the call, instead of sending rows the server cannot
+  read.
+- A timestamp range bound with fewer than six fractional digits decodes to `datetime` on Python
+  versions before 3.11 instead of leaving the whole range as text.
 
 - `TIMESTAMPTZ`, `TIMESTAMP` and `TIME` values with fewer than six fractional digits decode to
   `datetime` on Python versions before 3.11 instead of staying text.

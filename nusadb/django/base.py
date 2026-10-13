@@ -27,7 +27,14 @@ from .schema import DatabaseSchemaEditor
 ISOLATION_LEVELS = ("read uncommitted", "read committed", "repeatable read", "serializable")
 
 # The connection options passed through ``OPTIONS`` to :func:`nusadb.connect`.
-_CONNECT_OPTIONS = ("ssl", "timeout", "connect_timeout", "statement_timeout", "keepalive")
+_CONNECT_OPTIONS = (
+    "ssl",
+    "timeout",
+    "connect_timeout",
+    "statement_timeout",
+    "keepalive",
+    "prepare_threshold",
+)
 
 # A placeholder Django writes: ``%s`` by position, ``%(name)s`` by name, and ``%%`` for a ``%``.
 _PYFORMAT = re.compile(r"%%|%s|%\((\w+)\)s")
@@ -276,8 +283,9 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         ``PASSWORD``, ``HOST``, ``PORT`` and ``OPTIONS``.
 
         ``OPTIONS`` may hold ``isolation_level`` and the driver's ``ssl``, ``timeout``,
-        ``connect_timeout``, ``statement_timeout`` and ``keepalive``. An empty ``NAME`` connects
-        to the server's default database, ``nusadb``; an empty ``PASSWORD`` sends none.
+        ``connect_timeout``, ``statement_timeout``, ``keepalive`` and ``prepare_threshold``. An
+        empty ``NAME`` connects to the server's default database, ``nusadb``; an empty
+        ``PASSWORD`` sends none.
         """
         settings_dict = self.settings_dict
         options = dict(settings_dict.get("OPTIONS") or {})

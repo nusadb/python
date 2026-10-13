@@ -15,10 +15,11 @@ from typing import List, Optional, Tuple
 
 # Protocol magic: ASCII "NUSA".
 PROTOCOL_MAGIC = 0x4E555341
-# Request minor 2 to receive the typed RowDescription (per-column type tags) AND the element type of
-# an ARRAY column (protocol 1.2). An older server ignores the minor and answers with a form the driver
-# still handles (1.1 = typed scalars only; 1.0 = untyped names).
-PROTOCOL_VERSION = (1, 2)
+# Request minor 3: the typed RowDescription (per-column type tags, 1.1), the element type of an
+# ARRAY column (1.2) and NoticeResponse messages (1.3). The server answers at the lower of its minor and
+# this one, in a form the driver handles at every minor (1.2 has no notices, 1.1 types scalars only,
+# 1.0 names columns without types).
+PROTOCOL_VERSION = (1, 3)
 HEADER_LEN = 5
 MAX_FRAME_LEN = 256 * 1024 * 1024
 
@@ -86,6 +87,7 @@ B_COPY_OUT = ord("H")
 B_COPY_DATA = ord("d")
 B_COPY_DONE = ord("c")
 B_NOTIFICATION_RESPONSE = ord("A")  # async LISTEN/NOTIFY: [pid:u32][channel:str][payload:str]
+B_NOTICE_RESPONSE = ord("N")  # protocol 1.3: [severity:str][code:str][message:str]
 
 # Authentication sub-codes (the leading u32 of an `R` message).
 AUTH_OK = 0
@@ -222,15 +224,13 @@ def close_statement(name: str) -> bytes:
     return Writer().u8(ord("S")).string(name).frame(T_CLOSE)
 
 
-def bind(portal: str, statement: str, params: List[Optional[bytes]]) -> bytes:
-    return (
-        Writer()
-        .string(portal)
-        .string(statement)
-        .fields(params)
-        .u16(0)  # result format count: empty => all text
-        .frame(T_BIND)
-    )
+def bind(portal: str, statement: str, params: List[Optional[bytes]], binary: bool = False) -> bytes:
+    """A ``Bind`` frame. Every result column comes back in text, or with ``binary`` in the binary
+    format of wire-protocol §11.2 (one result-format code, ``1``, that applies to all columns)."""
+    w = Writer().string(portal).string(statement).fields(params)
+    if binary:
+        return w.u16(1).u16(1).frame(T_BIND)
+    return w.u16(0).frame(T_BIND)  # result format count: empty => all text
 
 
 def describe_portal(name: str) -> bytes:

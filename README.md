@@ -56,6 +56,8 @@ database. The query keys are:
 | `tls` | `disable`, `require`, or `insecure` (no verification, for tests) |
 | `tls_ca` | a PEM file of CA certificates to trust instead of the system roots |
 | `tls_cert`, `tls_key` | the client certificate and key, for a server that requires one |
+| `binary` | `true` to ask for results in the binary format (see [Binary results](#binary-results)) |
+| `prepare_threshold` | runs before a statement is prepared on the server, or `none` (see [Prepared statements](#prepared-statements)) |
 
 A duration is a number of seconds or a number with `ms`, `s`, `min` or `h` (`500ms`, `5min`). The
 same names work as keyword arguments, in seconds: `connect(timeout=10, statement_timeout=2.5)`;
@@ -102,6 +104,41 @@ text even when it looks like a number (`"007"` keeps its zeros), and an `int` st
 Wrap a list in `nusadb.Json` to send it as a JSON array rather than a SQL array. Any other type is
 sent as its `str()` and the server works out its type.
 
+## SQL composition
+
+A parameter stands for a value, never for a table or column name. To build SQL with names (or
+values) that come from elsewhere, compose it with `nusadb.sql` instead of pasting strings:
+
+```python
+from nusadb import sql
+
+query = sql.SQL("SELECT {fields} FROM {table} WHERE {key} = {value}").format(
+    fields=sql.SQL(", ").join(sql.Identifier(name) for name in ["id", "name"]),
+    table=sql.Identifier("app", "users"),
+    key=sql.Identifier("id"),
+    value=sql.Placeholder(),
+)
+cur.execute(query, [42])
+print(query.as_string(conn))  # SELECT "id", "name" FROM "app"."users" WHERE "id" = %s
+```
+
+- `sql.SQL(text)` is SQL written by the program and is used as it is. `format()` fills `{}`,
+  `{0}` and `{name}` fields with other pieces (`{{` and `}}` are literal braces), `join(pieces)`
+  puts the text between pieces, and `+` joins two pieces.
+- `sql.Identifier("schema", "table")` quotes each part with double quotes, doubling a quote inside
+  it: `"schema"."table"`. An empty name or a NUL character is refused.
+- `sql.Literal(value)` writes a value as a literal, the way it would bind as a parameter: `NULL`,
+  `true`, `42`, `'it''s'`, `'2024-01-01'::DATE`, `'1.5'::NUMERIC`. Text with a backslash is
+  written as `E'...'` with the backslash doubled, so it reads the same whatever the server's string
+  settings. A NUL character is refused.
+- `sql.Placeholder()` is a `%s` marker and `sql.Placeholder("name")` a `%(name)s` one, for values
+  passed with the statement.
+
+Whatever an `Identifier` or a `Literal` holds, it cannot end its own quoting, so it cannot change
+the statement around it. Every method that takes SQL text also takes one of these objects:
+`execute`, `executemany`, `prepare`, `prepare_cached`, `stream`, `pipeline().execute`, the `copy_*`
+methods and named cursors, blocking and asyncio alike.
+
 ## Value types
 
 Each column's type, reported by the server, decides the Python type it decodes to:
@@ -136,6 +173,36 @@ A value that does not parse as its type comes back as its text rather than raisi
 `cursor.description[i][1]` is the column's type name, and it compares equal to the PEP-249 type
 objects: `cur.description[0][1] == nusadb.NUMBER`. The module also provides `Date`, `Time`,
 `Timestamp`, `DateFromTicks`, `TimeFromTicks`, `TimestampFromTicks` and `Binary`.
+
+## Binary results
+
+Results come back as text by default. Ask for the binary format of the protocol instead and
+integers, floats, dates, times, timestamps, intervals, UUIDs, network addresses, bit strings and
+ranges travel in fixed binary layouts, which are smaller and need no parsing:
+
+```python
+conn = nusadb.connect(binary=True)            # every cursor of this connection
+cur = conn.cursor(binary=True)                # one cursor
+cur.execute("SELECT * FROM t", binary=True)   # one statement
+with conn.stream("SELECT * FROM events", binary=True) as rows:
+    ...
+```
+
+The URL takes `?binary=true`, and `nusadb.aio` has the same options. The values are the same Python
+objects either way: a test runs every column type both ways and compares them. Two things to know:
+
+- A `TIMESTAMPTZ` comes back in UTC. In text it carries the session's time zone offset, so with a
+  zone other than UTC the two are the same instant with a different `tzinfo`.
+- A decoder from `register_decoder` receives text, so in a binary result it applies only to the
+  types whose binary form is their text (`NUMERIC`, `TEXT`, `JSON`, arrays, `VECTOR`, the geometric
+  and full-text types, `XML`).
+
+A binary result needs the statement to run through the extended protocol, so a binary statement
+without parameters goes that way too. The statements the server runs only as a plain query
+(`DECLARE`, `FETCH`, `MOVE`, `CLOSE`, `COPY`, or several statements in one string) are sent as
+before and come back in text. A named cursor fetches in text for the same reason, and refuses
+`binary=True`. Array columns keep their element type (`ARRAY:INT` in `description`) in both
+formats: an array travels as its text even in binary.
 
 ## Transactions
 
@@ -232,6 +299,40 @@ These two use the default text format, so the statement must not set `FORMAT`, `
 `NULL`. A `COPY` the server refuses raises, and the connection stays usable; so does a row the
 driver cannot write, which loads nothing.
 
+### Binary COPY
+
+With `binary=True`, `copy_in_rows` writes the binary `COPY` stream (a signature and header, a row
+of length-prefixed fields per row, a trailer) and `copy_out_rows` reads one. The statement must say
+`WITH (FORMAT binary)`:
+
+```python
+types = ["INT", "TEXT", "DATE", "INT4RANGE"]
+conn.copy_in_rows(
+    "COPY t (id, name, born, ages) FROM STDIN (FORMAT binary)",
+    [(1, "alice", datetime.date(1990, 5, 1), nusadb.Range(18, 65))],
+    binary=True,
+    types=types,
+)
+rows = conn.copy_out_rows("COPY t TO STDOUT (FORMAT binary)", binary=True, types=types)
+```
+
+Each value is written in the binary layout of its column's type. `types` names the column types in
+order, with any spelling the server takes (`bigint`, `varchar(20)`, `numeric(10,2)`, `text[]`,
+`tstzrange`, ...). Without `types` each column's type follows from its Python values (`int` is
+`INT`, `str` is `TEXT`, a `date` is `DATE`, an aware `datetime` is `TIMESTAMPTZ`, a `Range` its
+range type), and a column whose values map to different types is refused. A binary field carries
+no type of its own, so the server reads it at its column's type: name the types whenever a column's
+type is not the one its Python values map to (an `int` for a `FLOAT` column, say). A value that does
+not fit its type (a `str` for an `INT`, a naive `datetime` for a `TIMESTAMPTZ`) is refused before it
+is sent, and nothing is loaded.
+
+`copy_out_rows` decodes each field at its type in `types` into the value a query returns for it;
+without `types` each field stays its raw `bytes`. The stream is checked strictly: the signature, no
+flag set, rows of one width (`len(types)`), lengths, the trailer and nothing after it. A fault
+raises `InterfaceError` once the `COPY` has ended. A statement whose format does not match the call
+(a text `COPY` with `binary=True`, or the other way round) raises `ProgrammingError`, and the
+connection stays usable either way.
+
 ## Pipelines
 
 `conn.pipeline()` sends a group of statements in one round trip. Inside the block, `p.execute`
@@ -262,6 +363,19 @@ cur.execute(insert, [3, "carol"])
 ```
 
 The server stores the text as it is, so a mistake in it is reported when the statement first runs.
+
+The driver also prepares statements on its own. Once the same SQL has run with parameters
+`prepare_threshold` times on a connection (5 by default), the next run prepares it on the server and
+later runs only bind new values, so the statement text is no longer sent each time. The statements
+share the 256-entry cache of `prepare_cached`, the least recently used closed first, and each set of
+parameter types gets its own statement. Set `prepare_threshold` with `connect()`, the URL, the
+`prepare_threshold` property, or `Pool` and `AsyncPool` options; `None` turns it off and `0`
+prepares from the first run. Statements without parameters, `executemany`, pipelines and streams are
+not prepared this way.
+
+If the server no longer knows a prepared statement, the driver drops it and runs the statement
+unprepared once, unless the error left the transaction failed, where nothing more may run. The
+server plans a prepared statement each time it runs it, so a table changed by DDL needs nothing more.
 
 ## Large results
 
@@ -311,6 +425,39 @@ something the driver already binds (a `str`, a number, a `datetime`, ...).
 `nusadb.register_decoder("NUMERIC", float)` decodes a column type your way; the type names are those
 in `cursor.description`, and an element type also applies inside arrays.
 
+## Composite types
+
+The server reports a composite column (`CREATE TYPE address AS (...)`) as `TEXT`, so its values
+arrive as record text such as `(Main,5)`. `nusadb.CompositeInfo` knows a type's fields and turns that
+text into a Python object with each field at its type:
+
+```python
+from nusadb import CompositeInfo, register_composite
+from nusadb.rows import composite_row
+
+info = CompositeInfo.fetch(conn, "address")    # reads the fields from the server
+home = info.load("(Main,5)")                   # address(street='Main', number=5)
+
+register_composite(info)                       # address values now bind as records
+cur.execute("INSERT INTO people (id, home) VALUES ($1, $2)", [1, home])
+
+cur = conn.cursor(row_factory=composite_row({"home": info}))
+cur.execute("SELECT id, home FROM people")
+cur.fetchone()                                 # (1, address(street='Main', number=5))
+```
+
+`fetch` reads the server's catalog of composite types, which only a superuser may read, and returns
+`None` for a type that does not exist. Any other role builds the info from the fields:
+`CompositeInfo("address", [("street", "TEXT"), ("number", "INT")])`. `CompositeInfo.fetch_async`
+does the same on an asyncio connection.
+
+`load` builds a named tuple by default. `register_composite(info, conn, factory=Address)` uses your
+own class instead (its constructor takes the fields in order, as a dataclass does), both for
+`load` and for binding; with a connection the binding applies to that connection only, with `None`
+to all of them. A bound value is sent as record text, which a composite column takes as it is; to
+compare with one, cast the parameter: `WHERE home = $1::address`. `composite_row` takes a mapping of
+column names to infos and, optionally, the row factory to build the rows with (`dict_row`, say).
+
 ## Stored procedures
 
 `cursor.callproc("name", [args])` runs `CALL name($1, ...)` and returns the arguments, as PEP-249
@@ -350,6 +497,54 @@ The options are `acquire_timeout` (how long a checkout waits; 30 seconds by defa
 ever), `idle_timeout`, `max_lifetime`, `test_on_checkout` (run `SELECT 1` before handing out an idle
 connection) and `reset_on_return`. Returning a connection twice raises `InterfaceError`.
 
+## Notices
+
+Besides errors, the server can send notices: warnings and notes about what a statement did
+(protocol 1.3). Each one is kept in `conn.notices` as a `nusadb.Notice` with `severity`
+(`"WARNING"`, `"NOTICE"`, ...), `sqlstate` and `message`, the most recent 100 at most, and is passed
+to the handlers added with `conn.add_notice_handler(fn)` (`remove_notice_handler` takes one away):
+
+```python
+conn.add_notice_handler(lambda n: print(n.severity, n.message))
+cur.execute("DROP TABLE IF EXISTS old_t")
+print(conn.notices[-1])
+```
+
+A notice can come in any reply, during a `COPY`, or on an idle connection while `poll` waits. A
+handler that raises is reported as a warning and does not stop the reply being read. A server before
+protocol 1.3 sends none, and the list stays empty.
+
+## Two-phase commit
+
+The DB-API two-phase commit methods prepare a transaction on the server so that its work survives
+until it is committed or rolled back by its id, from any connection:
+
+```python
+xid = conn.xid(1, "order-42", "billing")
+conn.tpc_begin(xid)
+cur.execute("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [10, 1])
+conn.tpc_prepare()        # PREPARE TRANSACTION
+conn.tpc_commit()         # COMMIT PREPARED; tpc_rollback() for ROLLBACK PREPARED
+```
+
+`tpc_begin` opens a transaction at once, in autocommit mode too; until the transaction ends,
+`commit()` and `rollback()` raise `ProgrammingError`, and after `tpc_prepare` nothing else runs on
+the connection. `tpc_commit()` and `tpc_rollback()` without an xid end the transaction begun on the
+connection, as a one-phase commit or rollback when it was not prepared. `tpc_recover()` lists the
+prepared transactions the server holds, and `tpc_commit(xid)` or `tpc_rollback(xid)` ends one of
+them from outside a transaction:
+
+```python
+for xid in conn.tpc_recover():
+    conn.tpc_rollback(xid)
+```
+
+On the server the id is a gid string: the format id, then the global transaction id and the branch
+qualifier base64-encoded, joined by `_` (`1_b3JkZXItNDI=_YmlsbGluZw==`). `nusadb.Xid.from_string`
+reads it back; any other gid, such as one made by hand, is accepted too, as a plain string or as the
+`gtrid` of an xid whose other parts are `None`. A recovered xid also has `prepared`, `owner` and
+`database`. `nusadb.aio` has the same methods, awaited (`xid` itself is not).
+
 ## Notifications (LISTEN/NOTIFY)
 
 `listen(channel)` subscribes the connection; a `notify(channel, payload)` from any connection on the
@@ -385,7 +580,8 @@ async with conn:
             ...
 ```
 
-Prepared statements, pipelined `executemany`, `COPY`, notifications, cancellation, row factories and
+Prepared statements, pipelined `executemany`, `COPY` (binary included), notifications, notices,
+two-phase commit, SQL composition, binary results, cancellation, row factories and
 `nusadb.aio.AsyncPool` (the options of `Pool`) all work the same way. Tasks sharing a connection take
 turns. A task cancelled while it waits on the server leaves its reply unread, so the connection is
 marked broken and the next call raises `OperationalError`.
@@ -432,7 +628,8 @@ DATABASES = {
 ```
 
 `OPTIONS` takes `isolation_level` (`"read committed"`, `"repeatable read"`, `"serializable"`, ...)
-and the driver's `ssl`, `timeout`, `connect_timeout`, `statement_timeout` and `keepalive`. An empty
+and the driver's `ssl`, `timeout`, `connect_timeout`, `statement_timeout`, `keepalive` and
+`prepare_threshold`. An empty
 `NAME` opens the default database `nusadb`. Migrations run in a transaction and roll back as a
 whole. Tests get their own database through `CREATE DATABASE`, so `USER` must be allowed to create
 databases (the superuser `nusadb-root`, or a role with `CREATEDB`). `manage.py dbshell` runs
@@ -470,7 +667,9 @@ NUSADB_SERVER_BIN=/path/to/nusadb-server python -m unittest discover -s tests
 ```
 
 The Django backend's tests in `tests/django` run as part of that when Django is installed. They
-start their own server on a free port between 5700 and 5799.
+start their own server on a free port between 5700 and 5799. The notice and two-phase commit tests
+also run against a scripted server in `tests/fake_server.py`, which sends a notice anywhere in a
+reply; their live counterparts skip on a server without those features.
 
 ## License
 

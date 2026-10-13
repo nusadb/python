@@ -43,19 +43,35 @@ from typing import (
     Union,
 )
 
+from . import _binary
 from . import _protocol as proto
 from . import _scram
 from .connection import (
     _DEFAULTS,
     _ISOLATION_LEVELS,
+    _RECOVER_QUERY,
+    _TPC_PREPARED,
+    _UNKNOWN_STATEMENT,
+    _USES_TRACKED,
     Cursor,
+    Notice,
     Notification,
     RowFactory,
+    Xid,
+    _adapt,
+    _as_xid,
+    _deliver_notice,
+    _make_xid,
+    _recovered,
     _affected,
     _arrange,
     _bind,
     _bound_chunks,
+    _check_threshold,
     _decode_notification,
+    _encode_param,
+    _format_mismatch,
+    _needs_simple_query,
     _quote_identifier,
     _quote_literal,
     _read_description,
@@ -65,7 +81,9 @@ from .connection import (
     _compile,
     _copy_text_chunks,
     _CopyLines,
+    _scoped_adapters,
     _set_keepalive,
+    _sql_text,
     _to_native_placeholders,
 )
 from .exceptions import (
@@ -123,11 +141,25 @@ class AsyncConnection:
         self._lock = asyncio.Lock()
         self._cache_lock = asyncio.Lock()
         self._stream: Optional["AsyncRowStream"] = None
-        self._statements: "OrderedDict[str, AsyncPreparedStatement]" = OrderedDict()
+        # Prepared statements kept: `prepare_cached` ones under their SQL text, automatically
+        # prepared ones under `(native sql, parameter type tags)`.
+        self._statements: "OrderedDict[Any, AsyncPreparedStatement]" = OrderedDict()
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         #: The default ``row_factory`` of this connection's cursors (``None``: tuples).
         self.row_factory: Optional[RowFactory] = None
+        #: Whether this connection's cursors ask for results in the binary format by default.
+        self.binary: bool = bool(options.get("binary", False))
+        self._prepare_threshold = _check_threshold(options.get("prepare_threshold", 5))
+        self._uses: "OrderedDict[Tuple[str, bytes], int]" = OrderedDict()
+        # Adapters registered on this connection only (see `nusadb.types.register_composite`).
+        self._adapters: Dict[type, Callable[[Any], Any]] = {}
+        #: The :class:`~nusadb.Notice` messages the server sent with its replies, oldest first
+        #: (see :attr:`nusadb.Connection.notices`).
+        self.notices: List[Notice] = []
+        self._notice_handlers: List[Callable[[Notice], Any]] = []
+        self._tpc: Optional[Xid] = None
+        self._tpc_prepared = False
 
     # --- opening and closing ---
 
@@ -216,6 +248,99 @@ class AsyncConnection:
             return None
         return (self._pid, self._secret)
 
+    @property
+    def prepare_threshold(self) -> Optional[int]:
+        """How many times a statement runs with parameters before it is prepared on the server and
+        reused (``None``: never). See :func:`nusadb.connect`."""
+        return self._prepare_threshold
+
+    @prepare_threshold.setter
+    def prepare_threshold(self, value: Optional[int]) -> None:
+        self._prepare_threshold = _check_threshold(value)
+
+    # --- two-phase commit ---
+
+    def xid(self, format_id: int, gtrid: str, bqual: str) -> Xid:
+        """A transaction id for :meth:`tpc_begin` (see :meth:`nusadb.Connection.xid`)."""
+        return _make_xid(format_id, gtrid, bqual)
+
+    async def tpc_begin(self, xid: Union[Xid, str]) -> None:
+        """Begin a two-phase transaction (see :meth:`nusadb.Connection.tpc_begin`)."""
+        xid = _as_xid(xid)
+        async with self._exchange():
+            if self._tpc is not None:
+                raise ProgrammingError("a two-phase transaction is already in progress")
+            if self._status != "I":
+                raise ProgrammingError("tpc_begin must be called outside a transaction")
+            await self._control("BEGIN")
+            self._tpc, self._tpc_prepared = xid, False
+
+    async def tpc_prepare(self) -> None:
+        """``PREPARE TRANSACTION`` (see :meth:`nusadb.Connection.tpc_prepare`)."""
+        async with self._exchange():
+            if self._tpc is None:
+                raise ProgrammingError("tpc_prepare needs a transaction begun with tpc_begin")
+            if self._tpc_prepared:
+                raise ProgrammingError("the two-phase transaction is already prepared")
+            await self._control("PREPARE TRANSACTION " + _quote_literal(str(self._tpc)))
+            self._tpc_prepared = True
+
+    async def tpc_commit(self, xid: Union[Xid, str, None] = None) -> None:
+        """Commit a two-phase transaction (see :meth:`nusadb.Connection.tpc_commit`)."""
+        await self._tpc_end("COMMIT", xid)
+
+    async def tpc_rollback(self, xid: Union[Xid, str, None] = None) -> None:
+        """Roll back a two-phase transaction (see :meth:`nusadb.Connection.tpc_rollback`)."""
+        await self._tpc_end("ROLLBACK", xid)
+
+    async def tpc_recover(self) -> List[Xid]:
+        """The prepared transactions on the server (see :meth:`nusadb.Connection.tpc_recover`)."""
+        async with self._exchange():
+            _columns, types, rows, _tag = await self._control(_RECOVER_QUERY)
+        return _recovered(rows, types)
+
+    async def _tpc_end(self, action: str, xid: Union[Xid, str, None]) -> None:
+        async with self._exchange():
+            if xid is not None:
+                if self._tpc is not None:
+                    raise ProgrammingError(
+                        f"tpc_{action.lower()} with an xid cannot run inside a two-phase "
+                        "transaction"
+                    )
+                if self._status != "I":
+                    raise ProgrammingError(
+                        f"tpc_{action.lower()} with an xid must be called outside a transaction"
+                    )
+                await self._control(f"{action} PREPARED " + _quote_literal(str(_as_xid(xid))))
+                return
+            if self._tpc is None:
+                raise ProgrammingError(
+                    f"tpc_{action.lower()} needs a transaction begun with tpc_begin"
+                )
+            try:
+                if self._tpc_prepared:
+                    await self._control(f"{action} PREPARED " + _quote_literal(str(self._tpc)))
+                elif self._status != "I":
+                    failed = self._status == "E"
+                    *_unused, tag = await self._control(action)
+                    if action == "COMMIT" and (failed or tag == "ROLLBACK"):
+                        raise TransactionRolledBack(
+                            "a statement in the transaction failed, so COMMIT rolled it back"
+                        )
+            finally:
+                self._tpc, self._tpc_prepared = None, False
+
+    # --- notices ---
+
+    def add_notice_handler(self, handler: Callable[[Notice], Any]) -> None:
+        """Call ``handler(notice)`` for each notice from now on (see
+        :meth:`nusadb.Connection.add_notice_handler`)."""
+        self._notice_handlers.append(handler)
+
+    def remove_notice_handler(self, handler: Callable[[Notice], Any]) -> None:
+        """Stop calling ``handler``; raises ``ValueError`` when it was not added."""
+        self._notice_handlers.remove(handler)
+
     # --- statements ---
 
     def cursor(
@@ -225,23 +350,31 @@ class AsyncConnection:
         name: Optional[str] = None,
         scrollable: Optional[bool] = None,
         withhold: bool = False,
+        binary: Optional[bool] = None,
     ) -> "AsyncCursor":
         """A new cursor; with a ``name``, an :class:`AsyncServerCursor` (see
-        :meth:`nusadb.Connection.cursor`)."""
+        :meth:`nusadb.Connection.cursor`, ``binary`` included)."""
         self._check_open()
         factory = row_factory if row_factory is not None else self.row_factory
         if name is not None:
+            if binary:
+                raise NotSupportedError(
+                    "a named cursor fetches in the text format; binary=True is not available"
+                )
             return AsyncServerCursor(self, name, factory, scrollable, withhold)
-        return AsyncCursor(self, factory)
+        return AsyncCursor(self, factory, self.binary if binary is None else binary)
 
-    async def execute(self, sql: str, parameters: Sequence[Any] = ()) -> "AsyncCursor":
+    async def execute(
+        self, sql: Any, parameters: Sequence[Any] = (), *, binary: Optional[bool] = None
+    ) -> "AsyncCursor":
         """Run ``sql`` on a new cursor and return it, ready to fetch from."""
         cur = self.cursor()
-        await cur.execute(sql, parameters)
+        await cur.execute(sql, parameters, binary=binary)
         return cur
 
-    async def prepare(self, sql: str) -> "AsyncPreparedStatement":
+    async def prepare(self, sql: Any) -> "AsyncPreparedStatement":
         """Parse ``sql`` once on the server (see :meth:`nusadb.Connection.prepare`)."""
+        sql = _sql_text(sql, self)
         async with self._exchange():
             name = f"nusadb_stmt_{next(self._names)}"
             self._send(proto.parse(name, _to_native_placeholders(sql)))
@@ -249,11 +382,12 @@ class AsyncConnection:
             await self._read_until_ready()
         return AsyncPreparedStatement(self, name, sql)
 
-    async def prepare_cached(self, sql: str) -> "AsyncPreparedStatement":
+    async def prepare_cached(self, sql: Any) -> "AsyncPreparedStatement":
         """:meth:`prepare`, reusing the statement already prepared for ``sql`` (up to
         :data:`nusadb.STATEMENT_CACHE_SIZE`, least recently used closed first)."""
         from . import connection as sync
 
+        sql = _sql_text(sql, self)
         # One at a time, so two tasks asking for the same text do not both prepare it.
         async with self._cache_lock:
             cached = self._statements.get(sql)
@@ -276,14 +410,25 @@ class AsyncConnection:
 
     def stream(
         self,
-        sql: str,
+        sql: Any,
         parameters: Sequence[Any] = (),
         batch_rows: int = 1024,
         row_factory: Optional[RowFactory] = None,
+        *,
+        binary: Optional[bool] = None,
     ) -> "AsyncRowStream":
         """Read a query's rows ``batch_rows`` at a time: ``async with conn.stream(sql) as rows:``
-        then ``async for row in rows``. The connection runs nothing else until the stream ends."""
-        return AsyncRowStream(self, sql, parameters, max(1, batch_rows), row_factory)
+        then ``async for row in rows``. The connection runs nothing else until the stream ends.
+        ``binary`` asks for the rows in the binary format (default: the connection's
+        :attr:`binary`)."""
+        return AsyncRowStream(
+            self,
+            _sql_text(sql, self),
+            parameters,
+            max(1, batch_rows),
+            row_factory,
+            self.binary if binary is None else binary,
+        )
 
     def pipeline(self) -> "AsyncPipeline":
         """``async with conn.pipeline() as p:`` queues statements and sends them together when the
@@ -294,6 +439,10 @@ class AsyncConnection:
     async def commit(self) -> None:
         """Commit the open transaction (see :meth:`nusadb.Connection.commit`)."""
         async with self._exchange():
+            if self._tpc is not None:
+                raise ProgrammingError(
+                    "commit() is not allowed in a two-phase transaction; use tpc_commit()"
+                )
             if self._status == "I":
                 return
             failed = self._status == "E"
@@ -306,6 +455,10 @@ class AsyncConnection:
     async def rollback(self) -> None:
         """Roll back the open transaction. Nothing to do outside one."""
         async with self._exchange():
+            if self._tpc is not None:
+                raise ProgrammingError(
+                    "rollback() is not allowed in a two-phase transaction; use tpc_rollback()"
+                )
             if self._status != "I":
                 await self._control("ROLLBACK")
 
@@ -358,23 +511,31 @@ class AsyncConnection:
         ``0`` only returns one already received); ``None`` when none arrives."""
         if self._notifications:
             return self._notifications.pop(0)
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
         async with self._exchange(reading=True):
             assert self._reader is not None
-            try:
-                # readexactly takes nothing until the whole header is there, so a timeout never
-                # cuts a message in half. A zero timeout still lets already-received bytes through.
-                header = await asyncio.wait_for(
-                    self._reader.readexactly(proto.HEADER_LEN),
-                    None if timeout is None else max(timeout, 0.001),
-                )
-            except asyncio.TimeoutError:
-                return None
-            except (asyncio.IncompleteReadError, OSError) as exc:
-                self._fail()
-                raise OperationalError(f"waiting for a notification failed: {exc}") from exc
-            self._pending = True
-            mtype, r = await self._read_rest(header)
-            self._pending = False
+            while True:
+                wait = None if deadline is None else max(deadline - loop.time(), 0.001)
+                try:
+                    # readexactly takes nothing until the whole header is there, so a timeout
+                    # never cuts a message in half. A zero timeout still lets already-received
+                    # bytes through.
+                    header = await asyncio.wait_for(
+                        self._reader.readexactly(proto.HEADER_LEN), wait
+                    )
+                except asyncio.TimeoutError:
+                    return None
+                except (asyncio.IncompleteReadError, OSError) as exc:
+                    self._fail()
+                    raise OperationalError(f"waiting for a notification failed: {exc}") from exc
+                self._pending = True
+                mtype, r = await self._read_rest(header)
+                self._pending = False
+                if mtype != proto.B_NOTICE_RESPONSE:
+                    break
+                # A notice on an idle connection: keep it, and go on waiting for a notification.
+                _deliver_notice(self, r)
             if mtype == proto.B_NOTIFICATION_RESPONSE:
                 return _decode_notification(r)
             if mtype == proto.B_ERROR:
@@ -388,17 +549,24 @@ class AsyncConnection:
 
     async def copy_in(
         self,
-        sql: str,
+        sql: Any,
         source: Union[bytes, Any],
     ) -> int:
         r"""Bulk-load through ``COPY ... FROM STDIN``. ``source`` is ``bytes``, an iterable or async
         iterable of ``bytes`` chunks, or a file-like whose ``read(size)`` returns ``bytes``
-        (awaited when it is a coroutine), already in the server's text format. Returns the number
+        (awaited when it is a coroutine), already in the statement's format. Returns the number
         of rows loaded."""
+        return await self._copy_in(_sql_text(sql, self), source, None)
+
+    async def _copy_in(self, sql: str, source: Any, expected_format: Optional[int]) -> int:
         async with self._exchange():
             await self._begin_if_needed()
             self._send(proto.query(sql))
-            await self._await_copy_start(proto.B_COPY_IN)
+            copy_format = await self._await_copy_start(proto.B_COPY_IN)
+            if expected_format is not None and copy_format != expected_format:
+                self._send(proto.copy_fail("nusadb: COPY format does not match the call"))
+                await self._drain_to_ready()
+                raise ProgrammingError(_format_mismatch(expected_format))
             chunks = _chunks(source).__aiter__()
             while True:
                 # Only the source's own failures end the COPY with CopyFail; a socket error while
@@ -420,14 +588,20 @@ class AsyncConnection:
             return await self._finish_copy()
 
     async def copy_out(
-        self, sql: str, sink: Callable[[bytes], Union[Any, Awaitable[Any]]]
+        self, sql: Any, sink: Callable[[bytes], Union[Any, Awaitable[Any]]]
     ) -> int:
         """Bulk-export through ``COPY ... TO STDOUT``: ``sink(chunk)`` is called (and awaited
         when it returns an awaitable) with each chunk. Returns the number of rows exported."""
+        return await self._copy_out(_sql_text(sql, self), sink, None)
+
+    async def _copy_out(self, sql: str, sink: Any, expected_format: Optional[int]) -> int:
         async with self._exchange():
             await self._begin_if_needed()
             self._send(proto.query(sql))
-            await self._await_copy_start(proto.B_COPY_OUT)
+            copy_format = await self._await_copy_start(proto.B_COPY_OUT)
+            if expected_format is not None and copy_format != expected_format:
+                await self._drain_to_ready()
+                raise ProgrammingError(_format_mismatch(expected_format))
             while True:
                 mtype, r = await self._read_message()
                 if mtype == proto.B_COPY_DATA:
@@ -442,19 +616,48 @@ class AsyncConnection:
                     raise from_sqlstate(*error)
             return await self._finish_copy()
 
-    async def copy_in_rows(self, sql: str, rows: Union[Iterable[Any], AsyncIterable[Any]]) -> int:
+    async def copy_in_rows(
+        self,
+        sql: Any,
+        rows: Union[Iterable[Any], AsyncIterable[Any]],
+        binary: bool = False,
+        types: Optional[Sequence[str]] = None,
+    ) -> int:
         """Bulk-load Python rows (an iterable or async iterable of value sequences) through
-        ``COPY ... FROM STDIN`` in the default text format; see
+        ``COPY ... FROM STDIN``, in the text format or, with ``binary=True``, the binary one; see
         :meth:`nusadb.Connection.copy_in_rows`. Returns the number of rows loaded."""
-        if hasattr(rows, "__aiter__"):
-            return await self.copy_in(sql, _async_copy_text_chunks(rows))
-        return await self.copy_in(sql, _copy_text_chunks(rows))
+        sql = _sql_text(sql, self)
+        if binary:
+            writer = _binary.CopyWriter(types, _adapt, _encode_param)
+            if hasattr(rows, "__aiter__"):
+                source: Any = _async_copy_binary_chunks(rows, writer)
+            else:
+                source = _binary.copy_binary_chunks(rows, writer)
+        else:
+            if types is not None:
+                raise ProgrammingError("types= applies to a binary COPY (binary=True)")
+            if hasattr(rows, "__aiter__"):
+                source = _async_copy_text_chunks(rows)
+            else:
+                source = _copy_text_chunks(rows)
+        with _scoped_adapters(self._adapters):
+            return await self._copy_in(sql, source, 1 if binary else 0)
 
-    async def copy_out_rows(self, sql: str) -> List[Tuple[Optional[str], ...]]:
-        """Export through ``COPY ... TO STDOUT`` as a list of rows, each a tuple of field text
-        (``None`` for NULL); see :meth:`nusadb.Connection.copy_out_rows`."""
+    async def copy_out_rows(
+        self, sql: Any, binary: bool = False, types: Optional[Sequence[str]] = None
+    ) -> List[Tuple[Any, ...]]:
+        """Export through ``COPY ... TO STDOUT`` as a list of rows: field text in the text format,
+        or with ``binary=True`` values decoded at ``types``; see
+        :meth:`nusadb.Connection.copy_out_rows`."""
+        sql = _sql_text(sql, self)
+        if binary:
+            reader = _binary.CopyReader(types, Cursor._decode_binary_cell)
+            await self._copy_out(sql, reader, 1)
+            return reader.finish()
+        if types is not None:
+            raise ProgrammingError("types= applies to a binary COPY (binary=True)")
         lines = _CopyLines()
-        await self.copy_out(sql, lines)
+        await self._copy_out(sql, lines, 0)
         return lines.finish()
 
     # --- cancellation ---
@@ -528,6 +731,14 @@ class AsyncConnection:
             raise OperationalError(f"reading from the server failed: {exc}") from exc
 
     async def _read_message(self) -> Tuple[int, proto.Reader]:
+        """The next message of a reply; a notice is delivered (see :attr:`notices`) and skipped."""
+        while True:
+            mtype, r = await self._read_one()
+            if mtype != proto.B_NOTICE_RESPONSE:
+                return mtype, r
+            _deliver_notice(self, r)
+
+    async def _read_one(self) -> Tuple[int, proto.Reader]:
         await self._flush()
         # Set while a message is half read: a task cancelled there leaves bytes on the socket that
         # are not a message header, and only dropping the connection gets back in step.
@@ -605,10 +816,12 @@ class AsyncConnection:
         return await self._read_until_ready()
 
     async def _begin_if_needed(self) -> None:
+        if self._tpc_prepared:
+            raise ProgrammingError(_TPC_PREPARED)
         if not self._autocommit and self._status == "I":
             await self._control("BEGIN")
 
-    async def _read_until_ready(self) -> _Result:
+    async def _read_until_ready(self, on_parse: Optional[Callable[[], None]] = None) -> _Result:
         columns: List[str] = []
         column_types: List[Optional[str]] = []
         rows: List[List[Optional[bytes]]] = []
@@ -616,7 +829,9 @@ class AsyncConnection:
         error: Optional[Tuple[str, str]] = None
         while True:
             mtype, r = await self._read_message()
-            if mtype in (proto.B_ROW_DESCRIPTION, proto.B_ROW_DESCRIPTION_TYPED):
+            if mtype == proto.B_PARSE_COMPLETE and on_parse is not None:
+                on_parse()
+            elif mtype in (proto.B_ROW_DESCRIPTION, proto.B_ROW_DESCRIPTION_TYPED):
                 columns, column_types = _read_description(mtype, r)
             elif mtype == proto.B_DATA_ROW:
                 rows.append(r.fields())
@@ -639,24 +854,102 @@ class AsyncConnection:
             if mtype == proto.B_READY:
                 return
 
-    async def _query(self, sql: str, parameters: Sequence[Any]) -> _Result:
+    async def _query(
+        self, sql: str, parameters: Sequence[Any], binary: bool = False, auto: bool = True
+    ) -> Tuple[_Result, bool]:
+        """Run ``sql``: a simple query without parameters (or through Parse and Bind for a binary
+        result), else Parse, Bind and Execute, with a statement prepared on the server once it has
+        run :attr:`prepare_threshold` times. Returns the result and whether it is binary."""
         await self._begin_if_needed()
         if not parameters:
+            if binary and not _needs_simple_query(sql):
+                return await self._run_unnamed(sql, b"", [], True), True
             self._send(proto.query(sql))
-            return await self._read_until_ready()
+            return await self._read_until_ready(), False
         compiled = _compile(sql)
-        encoded, tags = _bind(_arrange(compiled, parameters))
-        self._send(proto.parse("", compiled.sql, tags))
-        self._send(proto.bind("", "", encoded))
+        with _scoped_adapters(self._adapters):
+            encoded, tags = _bind(_arrange(compiled, parameters))
+        key = (compiled.sql, tags)
+        name, parse = self._auto_statement(key) if auto else (None, False)
+        if name is None:
+            return await self._run_unnamed(compiled.sql, tags, encoded, binary), binary
+        if parse:
+            self._send(proto.parse(name, compiled.sql, tags))
+        self._send(proto.bind("", name, encoded, binary))
+        self._send(proto.describe_portal(""))
+        self._send(proto.execute("", 0))
+        self._send(proto.sync())
+        try:
+            remember = (lambda: self._remember(key, name, compiled.sql)) if parse else None
+            return await self._read_until_ready(remember), binary
+        except DatabaseError as exc:
+            if parse or getattr(exc, "sqlstate", None) != _UNKNOWN_STATEMENT:
+                raise
+            # The server no longer knows the statement: forget it and run it unprepared once,
+            # unless the error failed the transaction.
+            self._forget(key)
+            if self._status == "E":
+                raise
+            return await self._run_unnamed(compiled.sql, tags, encoded, binary), binary
+        finally:
+            if parse:
+                await self._trim_statements()
+
+    async def _run_unnamed(
+        self, sql: str, tags: bytes, encoded: List[Optional[bytes]], binary: bool
+    ) -> _Result:
+        self._send(proto.parse("", sql, tags))
+        self._send(proto.bind("", "", encoded, binary))
         self._send(proto.describe_portal(""))
         self._send(proto.execute("", 0))
         self._send(proto.sync())
         return await self._read_until_ready()
 
-    async def _query_prepared(self, name: str, parameters: Sequence[Any]) -> _Result:
+    def _auto_statement(self, key: Tuple[str, bytes]) -> Tuple[Optional[str], bool]:
+        """See :meth:`nusadb.Connection._auto_statement`."""
+        threshold = self._prepare_threshold
+        if threshold is None:
+            return None, False
+        cached = self._statements.get(key)
+        if cached is not None and not cached.closed:
+            self._statements.move_to_end(key)
+            return cached.name, False
+        uses = self._uses.pop(key, 0)
+        if uses < threshold:
+            self._uses[key] = uses + 1
+            while len(self._uses) > _USES_TRACKED:
+                self._uses.popitem(last=False)
+            return None, False
+        return f"nusadb_auto_{next(self._names)}", True
+
+    def _remember(self, key: Tuple[str, bytes], name: str, sql: str) -> None:
+        self._statements[key] = AsyncPreparedStatement(self, name, sql)
+
+    def _forget(self, key: Tuple[str, bytes]) -> None:
+        stale = self._statements.pop(key, None)
+        if stale is not None:
+            stale.closed = True
+
+    async def _trim_statements(self) -> None:
+        """Close the least recently used prepared statements past the cache size. Called inside an
+        exchange, so the statements are closed directly."""
+        from . import connection as sync
+
+        while len(self._statements) > sync.STATEMENT_CACHE_SIZE:
+            _key, oldest = self._statements.popitem(last=False)
+            if not oldest.closed and not self._closed and not self._broken:
+                oldest.closed = True
+                self._send(proto.close_statement(oldest.name))
+                self._send(proto.sync())
+                await self._read_until_ready()
+
+    async def _query_prepared(
+        self, name: str, parameters: Sequence[Any], binary: bool = False
+    ) -> _Result:
         await self._begin_if_needed()
-        encoded, _tags = _bind(parameters)
-        self._send(proto.bind("", name, encoded))
+        with _scoped_adapters(self._adapters):
+            encoded, _tags = _bind(parameters)
+        self._send(proto.bind("", name, encoded, binary))
         self._send(proto.describe_portal(""))
         self._send(proto.execute("", 0))
         self._send(proto.sync())
@@ -670,7 +963,7 @@ class AsyncConnection:
         sql = compiled.sql
         total, counted = 0, False
         rows = (_arrange(compiled, parameters) for parameters in seq_of_parameters)
-        for chunk, failure in _bound_chunks(rows):
+        for chunk, failure in _bound_chunks(rows, self._adapters):
             if chunk:
                 tags: Optional[bytes] = None
                 for encoded, row_tags in chunk:
@@ -706,12 +999,12 @@ class AsyncConnection:
             raise from_sqlstate(*error)
         return total, counted
 
-    async def _await_copy_start(self, expected: int) -> None:
+    async def _await_copy_start(self, expected: int) -> int:
         error: Optional[Tuple[str, str]] = None
         while True:
             mtype, r = await self._read_message()
             if mtype == expected:
-                return
+                return r.u8() if r.remaining() else 0
             if mtype in (proto.B_COPY_IN, proto.B_COPY_OUT):
                 if mtype == proto.B_COPY_IN:
                     self._send(proto.copy_fail("nusadb: COPY direction does not match the call"))
@@ -759,29 +1052,34 @@ class AsyncPipeline:
 
     async def execute(
         self,
-        sql: str,
+        sql: Any,
         parameters: Any = (),
         row_factory: Optional[RowFactory] = None,
+        *,
+        binary: Optional[bool] = None,
     ) -> "AsyncCursor":
         """Queue ``sql`` with ``parameters``; the returned cursor holds its result after the next
-        sync. Sends the queue first when it is full."""
+        sync. Sends the queue first when it is full. ``binary`` asks for the result in the binary
+        format (default: the connection's :attr:`~AsyncConnection.binary`)."""
         if not self._active:
             raise ProgrammingError(
                 "use the pipeline as a context manager: async with conn.pipeline() as p"
             )
         conn = self._conn
         conn._check_open()
-        compiled = _compile(sql)
-        encoded, tags = _bind(_arrange(compiled, parameters))
+        binary = conn.binary if binary is None else binary
+        compiled = _compile(_sql_text(sql, conn))
+        with _scoped_adapters(conn._adapters):
+            encoded, tags = _bind(_arrange(compiled, parameters))
         frames = b"".join(
             (
                 proto.parse("", compiled.sql, tags),
-                proto.bind("", "", encoded),
+                proto.bind("", "", encoded, binary),
                 proto.describe_portal(""),
                 proto.execute("", 0),
             )
         )
-        cursor = conn.cursor(row_factory)
+        cursor = conn.cursor(row_factory, binary=binary)
         self._queued.append((frames, cursor))
         self._size += len(frames)
         if len(self._queued) >= PIPELINE_SYNC_STATEMENTS or self._size >= _COPY_CHUNK:
@@ -810,7 +1108,8 @@ class AsyncPipeline:
                 elif mtype == proto.B_DATA_ROW:
                     rows.append(r.fields())
                 elif mtype == proto.B_COMMAND_COMPLETE:
-                    next(cursors)._load((columns, column_types, rows, r.string()))
+                    cursor = next(cursors)
+                    cursor._load((columns, column_types, rows, r.string()), cursor.binary)
                     columns, column_types, rows = [], [], []
                 elif mtype == proto.B_ERROR:
                     error = (r.string(), r.string())
@@ -891,8 +1190,15 @@ async def _chunks(source: Any) -> AsyncIterator[bytes]:
 class AsyncCursor:
     """A cursor whose ``execute`` and ``fetch*`` are coroutines."""
 
-    def __init__(self, connection: AsyncConnection, row_factory: Optional[RowFactory]) -> None:
+    def __init__(
+        self,
+        connection: AsyncConnection,
+        row_factory: Optional[RowFactory],
+        binary: bool = False,
+    ) -> None:
         self._conn = connection
+        #: Whether :meth:`execute` asks for results in the binary format.
+        self.binary = binary
         # Decoding and row building are shared with the blocking cursor.
         self._rows = Cursor(_Detached(), row_factory)  # type: ignore[arg-type]
         self.arraysize = 1
@@ -922,35 +1228,44 @@ class AsyncCursor:
             raise ProgrammingError("cursor is closed")
         self._conn._check_open()
 
-    def _load(self, result: _Result) -> None:
-        self._rows._load(*result)
+    def _load(self, result: _Result, binary: bool = False) -> None:
+        self._rows._load(*result, binary)
         self.rowcount = self._rows.rowcount
 
     async def execute(
         self,
-        operation: Union[str, "AsyncPreparedStatement"],
+        operation: Union[str, "AsyncPreparedStatement", Any],
         parameters: Optional[Sequence[Any]] = None,
+        *,
+        binary: Optional[bool] = None,
     ) -> "AsyncCursor":
+        """Run ``operation`` (see :meth:`nusadb.Cursor.execute`, ``binary`` included)."""
         self._check()
+        binary = self.binary if binary is None else binary
+        if not isinstance(operation, AsyncPreparedStatement):
+            operation = _sql_text(operation, self._conn)
         async with self._conn._exchange():
             if isinstance(operation, AsyncPreparedStatement):
                 result = await self._conn._query_prepared(
                     self._statement_name(operation),
                     _arrange(operation._compiled, parameters or ()),
+                    binary,
                 )
             else:
-                result = await self._conn._query(operation, parameters or ())
-        self._load(result)
+                result, binary = await self._conn._query(operation, parameters or (), binary)
+        self._load(result, binary)
         return self
 
     async def executemany(
         self,
-        operation: Union[str, "AsyncPreparedStatement"],
+        operation: Union[str, "AsyncPreparedStatement", Any],
         seq_of_parameters: Any,
     ) -> None:
         """Run ``operation`` once per parameter set, pipelined (see
         :meth:`nusadb.Cursor.executemany`)."""
         self._check()
+        if not isinstance(operation, AsyncPreparedStatement):
+            operation = _sql_text(operation, self._conn)
         async with self._conn._exchange():
             if isinstance(operation, AsyncPreparedStatement):
                 name = self._statement_name(operation)
@@ -1039,18 +1354,21 @@ class AsyncServerCursor(AsyncCursor):
         self.rownumber: Optional[int] = None
 
     async def execute(  # type: ignore[override]
-        self, operation: str, parameters: Optional[Any] = None
+        self, operation: Any, parameters: Optional[Any] = None, *, binary: Optional[bool] = None
     ) -> "AsyncServerCursor":
         """Declare the cursor for ``operation``, closing the one declared before."""
         self._check()
-        if not isinstance(operation, str):
+        if isinstance(operation, AsyncPreparedStatement):
             raise NotSupportedError("a named cursor takes SQL text, not a prepared statement")
+        if binary:
+            raise NotSupportedError("a named cursor fetches in the text format")
+        operation = _sql_text(operation, self._conn)
         await self._close_on_server()
         scroll = {None: "", True: "SCROLL ", False: "NO SCROLL "}[self.scrollable]
         hold = " WITH HOLD" if self.withhold else ""
         sql = f"DECLARE {_quote_identifier(self.name)} {scroll}CURSOR{hold} FOR {operation}"
         async with self._conn._exchange():
-            await self._conn._query(sql, parameters or ())
+            await self._conn._query(sql, parameters or (), auto=False)
         self._declared = True
         self._rows._load([], [], [], None)
         self._fetched = 0
@@ -1124,7 +1442,7 @@ class AsyncServerCursor(AsyncCursor):
 
     async def _fetch(self, how: str) -> None:
         async with self._conn._exchange():
-            columns, column_types, rows, _tag = await self._conn._query(
+            (columns, column_types, rows, _tag), _binary_result = await self._conn._query(
                 f"FETCH {how} FROM {_quote_identifier(self.name)}", ()
             )
         if not columns:
@@ -1135,7 +1453,7 @@ class AsyncServerCursor(AsyncCursor):
 
     async def _position(self, row: int) -> bool:
         async with self._conn._exchange():
-            _columns, _types, rows, _tag = await self._conn._query(
+            (_columns, _types, rows, _tag), _binary_result = await self._conn._query(
                 f"FETCH ABSOLUTE {row} FROM {_quote_identifier(self.name)}", ()
             )
         return bool(rows)
@@ -1279,13 +1597,14 @@ class AsyncRowStream:
         parameters: Sequence[Any],
         batch_rows: int,
         row_factory: Optional[RowFactory],
+        binary: bool = False,
     ) -> None:
         self._conn = connection
         self._sql = sql
         self._parameters = parameters
         self._batch = batch_rows
         self._cursor = AsyncCursor(
-            connection, row_factory if row_factory is not None else connection.row_factory
+            connection, row_factory if row_factory is not None else connection.row_factory, binary
         )
         self._started = False
         self._done = False
@@ -1305,9 +1624,10 @@ class AsyncRowStream:
         try:
             await conn._begin_if_needed()
             compiled = _compile(self._sql)
-            encoded, tags = _bind(_arrange(compiled, self._parameters))
+            with _scoped_adapters(conn._adapters):
+                encoded, tags = _bind(_arrange(compiled, self._parameters))
             conn._send(proto.parse("", compiled.sql, tags))
-            conn._send(proto.bind("", "", encoded))
+            conn._send(proto.bind("", "", encoded, self._cursor.binary))
             conn._send(proto.describe_portal(""))
             conn._send(proto.execute("", self._batch))
         except BaseException:
@@ -1347,10 +1667,11 @@ class AsyncRowStream:
                 for _ in range(count):
                     columns.append(r.string())
                     types.append(proto.type_name(r.u8()))
-                rows_view._load(columns, types, [], None)
+                rows_view._load(columns, types, [], None, self._cursor.binary)
             elif mtype == proto.B_ROW_DESCRIPTION:
                 count = r.u16()
-                rows_view._load([r.string() for _ in range(count)], [None] * count, [], None)
+                names = [r.string() for _ in range(count)]
+                rows_view._load(names, [None] * count, [], None, self._cursor.binary)
             elif mtype == proto.B_DATA_ROW:
                 rows.append(r.fields())
             elif mtype == proto.B_PORTAL_SUSPENDED:
@@ -1596,3 +1917,17 @@ class _PooledAsyncConnection:
         if self._conn is not None:
             await self._pool.release(self._conn)
             self._conn = None
+
+
+async def _async_copy_binary_chunks(
+    rows: AsyncIterable[Any], writer: "_binary.CopyWriter"
+) -> AsyncIterator[bytes]:
+    """An async iterable of rows as a binary COPY stream, in chunks of about 64 KiB."""
+    buf = bytearray(writer.HEADER)
+    async for row in rows:
+        buf += writer.row(row)
+        if len(buf) >= _COPY_CHUNK:
+            yield bytes(buf)
+            buf = bytearray()
+    buf += writer.TRAILER
+    yield bytes(buf)

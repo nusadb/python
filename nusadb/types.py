@@ -4,7 +4,8 @@ A range column decodes to :class:`Range`, ``INET`` to an :mod:`ipaddress` interf
 for a single host), ``CIDR`` to an :mod:`ipaddress` network and ``VECTOR`` to a list of floats. Each
 binds back as a parameter: a :class:`Range` or an :mod:`ipaddress` value directly, a vector through
 :class:`Vector` (a plain list binds as an array). A composite value arrives as its text form, which
-:func:`parse_record` splits into its fields.
+:func:`parse_record` splits into its fields; :class:`CompositeInfo` turns it into a Python object
+with typed fields, and :func:`register_composite` binds such objects back as records.
 """
 
 from __future__ import annotations
@@ -13,9 +14,16 @@ import datetime as _dt
 import ipaddress
 import re
 from decimal import Decimal
-from typing import Any, Iterable, List, Optional, Tuple, Union
+from collections import namedtuple
+from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
-__all__ = ["Range", "Vector", "parse_record"]
+from .exceptions import DataError, ProgrammingError
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .aio import AsyncConnection
+    from .connection import Connection
+
+__all__ = ["Range", "Vector", "parse_record", "CompositeInfo", "register_composite"]
 
 _BOUNDS = ("[)", "(]", "()", "[]")
 
@@ -137,6 +145,7 @@ _INT = re.compile(r"[+-]?\d+")
 _DECIMAL = re.compile(r"[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _OFFSET = re.compile(r"(?<=\d)([+-]\d{2}):?(\d{2})?$")
+_FRACTION = re.compile(r"\.(\d{1,6})(?=[+-]|$)")
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([+-]\d{2}(:?\d{2})?|Z)?")
 
 
@@ -155,6 +164,9 @@ def _decode_bound(text: str) -> Any:
         normalized = _OFFSET.sub(
             lambda m: f"{m.group(1)}:{m.group(2) or '00'}", text.replace("Z", "+00:00")
         )
+        # Fractional seconds padded to six digits: `fromisoformat` before Python 3.11 reads only
+        # three or six.
+        normalized = _FRACTION.sub(lambda m: "." + m.group(1).ljust(6, "0"), normalized)
         return _dt.datetime.fromisoformat(normalized)
     return text
 
@@ -240,3 +252,205 @@ def parse_record(text: str) -> Tuple[Optional[str], ...]:
     if not (body.startswith("(") and body.endswith(")")):
         raise ValueError(f"not a record: {text!r}")
     return tuple(_split_quoted(body[1:-1]))
+
+
+# The catalog of composite types: one row per type, its fields as alternating name and type text
+# joined by the unit separator. Only a superuser may read it.
+_COMPOSITE_QUERY = "SELECT def FROM nusadb_composites WHERE name = $1"
+_FIELD_SEPARATOR = "\x1f"
+_RECORD_SPECIALS = frozenset('(),"\\')
+
+
+class CompositeInfo:
+    """The fields of a composite type (``CREATE TYPE name AS (field type, ...)``), and how to turn
+    its values into Python objects and back.
+
+    The server reports a composite column as ``TEXT``, so its values arrive as record text such as
+    ``(1,"a b",)``. :meth:`load` converts that text into an instance of :attr:`python_type` (a
+    named tuple by default) with each field decoded at its type; :meth:`dump` writes an instance
+    back as record text. :func:`register_composite` makes instances bind as that text.
+
+    Build one with :meth:`fetch`, which reads the fields from the server's catalog (a superuser
+    connection), or directly from the field names and SQL types::
+
+        info = CompositeInfo("address", [("street", "TEXT"), ("number", "INT")])
+    """
+
+    def __init__(
+        self,
+        name: str,
+        fields: Sequence[Tuple[str, str]],
+        factory: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        if not fields:
+            raise ProgrammingError(f"composite type {name!r} has no fields")
+        self.name = name
+        #: ``(field name, SQL type)`` pairs, in declared order.
+        self.fields: List[Tuple[str, str]] = [(str(f), str(t)) for f, t in fields]
+        self._wires = [_field_wire(t) for _f, t in self.fields]
+        #: What :meth:`load` builds: ``factory`` if given, else a named tuple of the fields.
+        self.python_type: Callable[..., Any] = factory or namedtuple(  # type: ignore[assignment]
+            _class_name(name), self.field_names, rename=True
+        )
+
+    @property
+    def field_names(self) -> List[str]:
+        return [field for field, _type in self.fields]
+
+    @property
+    def field_types(self) -> List[str]:
+        return [sql_type for _field, sql_type in self.fields]
+
+    @classmethod
+    def fetch(cls, conn: "Connection", name: str) -> Optional["CompositeInfo"]:
+        """Read the fields of composite type ``name`` from the server, or ``None`` when there is
+        no such type. The catalog is readable by a superuser only; another role gets a
+        :class:`ProgrammingError` and builds the info from the field list instead."""
+        cur = conn.cursor(binary=False)
+        try:
+            for candidate in _candidates(name):
+                cur.execute(_COMPOSITE_QUERY, [candidate])
+                row = cur.fetchone()
+                if row is not None:
+                    return cls(candidate, _split_definition(candidate, row[0]))
+        except ProgrammingError as exc:
+            return _catalog_error(exc, name)
+        finally:
+            cur.close()
+        return None
+
+    @classmethod
+    async def fetch_async(cls, conn: "AsyncConnection", name: str) -> Optional["CompositeInfo"]:
+        """:meth:`fetch` on an asyncio connection."""
+        try:
+            for candidate in _candidates(name):
+                cur = await conn.execute(_COMPOSITE_QUERY, [candidate], binary=False)
+                row = await cur.fetchone()
+                if row is not None:
+                    return cls(candidate, _split_definition(candidate, row[0]))
+        except ProgrammingError as exc:
+            return _catalog_error(exc, name)
+        return None
+
+    def load(self, text: Optional[str]) -> Any:
+        """The record text ``text`` as a :attr:`python_type` instance, each field converted to the
+        Python type its SQL type decodes to (``None`` stays ``None``)."""
+        if text is None:
+            return None
+        if not isinstance(text, str):
+            raise DataError(f"a {self.name} value is record text, not {type(text).__name__}")
+        try:
+            parts = parse_record(text)
+        except ValueError as exc:
+            raise DataError(str(exc)) from None
+        if len(parts) != len(self.fields):
+            raise DataError(
+                f"a {self.name} value has {len(self.fields)} fields, got {len(parts)}: {text!r}"
+            )
+        from .connection import Cursor
+
+        values = [
+            None if part is None else Cursor._decode_cell(part.encode("utf-8"), wire)
+            for part, wire in zip(parts, self._wires)
+        ]
+        return self.python_type(*values)
+
+    def dump(self, value: Any) -> str:
+        """``value`` (a tuple of the fields in order, or an object with an attribute per field)
+        as record text, ``(f1,f2,...)``, each field written as it binds as a parameter."""
+        if isinstance(value, tuple):
+            items = tuple(value)
+        else:
+            try:
+                items = tuple(getattr(value, field) for field in self.field_names)
+            except AttributeError as exc:
+                raise ProgrammingError(f"cannot write {value!r} as a {self.name}: {exc}") from None
+        if len(items) != len(self.fields):
+            raise ProgrammingError(
+                f"a {self.name} has {len(self.fields)} fields, got {len(items)}"
+            )
+        return "(" + ",".join(_record_field(item) for item in items) + ")"
+
+    def __repr__(self) -> str:
+        return f"CompositeInfo({self.name!r}, {self.fields!r})"
+
+
+def register_composite(
+    info: CompositeInfo,
+    conn: Union["Connection", "AsyncConnection", None] = None,
+    factory: Optional[Callable[..., Any]] = None,
+) -> CompositeInfo:
+    """Make instances of ``info.python_type`` bind as ``info``'s record text, so they can be
+    passed as parameters (into a composite column, or compared with ``$1::typename``).
+
+    With ``factory`` (a class whose constructor takes the fields in order, such as a named tuple
+    or a dataclass) it becomes ``info.python_type``, both what :meth:`CompositeInfo.load` builds and
+    what binds. With a connection the binding applies to that connection only; with ``None``, to
+    every connection. Returns ``info``."""
+    if factory is not None:
+        info.python_type = factory
+    klass = info.python_type
+    if not isinstance(klass, type):
+        raise ProgrammingError("register_composite needs a class to bind; pass factory=")
+    if conn is None:
+        from .connection import register_adapter
+
+        register_adapter(klass, info.dump)
+    else:
+        conn._adapters[klass] = info.dump
+    return info
+
+
+def _candidates(name: str) -> List[str]:
+    return [name] if name == name.lower() else [name, name.lower()]
+
+
+def _split_definition(name: str, definition: Optional[str]) -> List[Tuple[str, str]]:
+    parts = (definition or "").split(_FIELD_SEPARATOR)
+    if len(parts) < 2 or len(parts) % 2:
+        raise DataError(f"could not read the fields of composite type {name!r}")
+    return list(zip(parts[0::2], parts[1::2]))
+
+
+def _catalog_error(exc: ProgrammingError, name: str) -> None:
+    state = getattr(exc, "sqlstate", None)
+    if state == "42P01":
+        return None  # no composite type has been created yet
+    if state == "42501":
+        raise ProgrammingError(
+            f"reading the fields of {name!r} needs a superuser; build "
+            f"CompositeInfo({name!r}, [(field, type), ...]) instead"
+        ) from exc
+    raise exc
+
+
+def _field_wire(sql_type: str) -> str:
+    from ._binary import wire_type
+
+    try:
+        wire = wire_type(sql_type)
+    except ProgrammingError:
+        return "TEXT"  # an enum, a domain: kept as text
+    return "RANGE" if wire.startswith("RANGE") else wire
+
+
+def _class_name(name: str) -> str:
+    cleaned = re.sub(r"\W", "_", name.rsplit(".", 1)[-1])
+    return cleaned if cleaned.isidentifier() else "Record"
+
+
+def _record_field(value: Any) -> str:
+    """One field of record text: empty for NULL, quoted when it holds a separator, a quote, a
+    backslash or space, or is empty."""
+    from .connection import _adapt, _encode_param
+
+    value = _adapt(value)
+    if value is None:
+        return ""
+    encoded = _encode_param(value)
+    text = "" if encoded is None else encoded.decode("utf-8")
+    if "\x00" in text:
+        raise ProgrammingError("a record field cannot hold a NUL character")
+    if text == "" or any(c in _RECORD_SPECIALS or c.isspace() for c in text):
+        return '"' + text.replace("\\", "\\\\").replace('"', '""') + '"'
+    return text

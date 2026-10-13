@@ -24,19 +24,22 @@ with a mapping of parameters (``%%`` is then a literal ``%``).
 
 from __future__ import annotations
 
-from . import rows
+from . import rows, sql
 from .connection import (
     PIPELINE_SYNC_STATEMENTS,
     STATEMENT_CACHE_SIZE,
     Connection,
     Cursor,
+    MAX_NOTICES,
     Json,
+    Notice,
     Notification,
     Pipeline,
     PreparedStatement,
     RowStream,
     ServerCursor,
     Transaction,
+    Xid,
     connect,
     register_adapter,
     register_decoder,
@@ -69,7 +72,7 @@ from .exceptions import (
     Warning,
 )
 from .pool import Pool
-from .types import Range, Vector, parse_record
+from .types import CompositeInfo, Range, Vector, parse_record, register_composite
 
 # PEP-249 module globals.
 apilevel = "2.0"
@@ -92,12 +95,18 @@ __all__ = [
     "register_adapter",
     "register_decoder",
     "rows",
+    "sql",
     "Json",
     "Notification",
+    "Notice",
+    "MAX_NOTICES",
+    "Xid",
     "Pool",
     "Range",
     "Vector",
     "parse_record",
+    "CompositeInfo",
+    "register_composite",
     "Date",
     "Time",
     "Timestamp",

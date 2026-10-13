@@ -12,10 +12,13 @@ each row from its values (a tuple)::
 from __future__ import annotations
 
 from collections import namedtuple
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 if TYPE_CHECKING:
     from .connection import Cursor
+    from .types import CompositeInfo
+
+RowFactory = Callable[["Cursor"], Callable[[Tuple[Any, ...]], Any]]
 
 
 def _names(cursor: "Cursor") -> List[str]:
@@ -38,3 +41,34 @@ def namedtuple_row(cursor: "Cursor") -> Callable[[Tuple[Any, ...]], Any]:
     ``_<position>``."""
     row_type = namedtuple("Row", _names(cursor), rename=True)  # type: ignore[misc]
     return lambda values: row_type(*values)
+
+
+def composite_row(
+    columns: Mapping[str, "CompositeInfo"], row_factory: Optional[RowFactory] = None
+) -> RowFactory:
+    """A row factory that loads composite columns: each column named in ``columns`` is turned
+    from its record text into an object by its :class:`~nusadb.types.CompositeInfo`, then the
+    row is built by ``row_factory`` (tuples by default). A named column missing from a result is
+    left out::
+
+        cur = conn.cursor(row_factory=composite_row({"home": address_info}, dict_row))
+        cur.execute("SELECT id, home FROM people")
+        cur.fetchone()  # {'id': 1, 'home': address(street='Main', number=5)}
+    """
+    inner = row_factory or tuple_row
+
+    def factory(cursor: "Cursor") -> Callable[[Tuple[Any, ...]], Any]:
+        loads = [(i, columns[name]) for i, name in enumerate(_names(cursor)) if name in columns]
+        build = inner(cursor)
+        if not loads:
+            return build
+
+        def make(values: Tuple[Any, ...]) -> Any:
+            loaded = list(values)
+            for i, info in loads:
+                loaded[i] = info.load(loaded[i])
+            return build(tuple(loaded))
+
+        return make
+
+    return factory
